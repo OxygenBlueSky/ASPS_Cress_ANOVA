@@ -1,0 +1,11 @@
+# RStudio / R session cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
