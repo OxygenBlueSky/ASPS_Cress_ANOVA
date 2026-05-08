@@ -1,0 +1,20 @@
+Cutoff scan for sprout_length  (rows with sprout_length > cutoff are kept)
+Initial skewness = -1.3   n = 11463
+  cutoff >  0.00  ->  skewness = -1.30   n = 11463
+  cutoff >  0.20  ->  skewness = -1.30   n = 11463
+  cutoff >  0.40  ->  skewness = -1.30   n = 11463
+  cutoff >  0.60  ->  skewness = -1.26   n = 11461
+  cutoff >  0.80  ->  skewness = -1.26   n = 11461
+  cutoff >  1.00  ->  skewness = -1.21   n = 11456
+  cutoff >  1.20  ->  skewness = -1.13   n = 11448
+  cutoff >  1.40  ->  skewness = -1.03   n = 11435
+  cutoff >  1.60  ->  skewness = -0.92   n = 11418
+  cutoff >  1.80  ->  skewness = -0.82   n = 11400
+  cutoff >  2.00  ->  skewness = -0.73   n = 11379
+  cutoff >  2.20  ->  skewness = -0.65   n = 11354
+  cutoff >  2.40  ->  skewness = -0.52   n = 11294
+  cutoff >  2.60  ->  skewness = -0.36   n = 11203
+  cutoff >  2.80  ->  skewness = -0.18   n = 11068
+  cutoff >  3.00  ->  skewness = -0.02   n = 10892
+  cutoff >  3.20  ->  skewness =  0.17   n = 10579
+  cutoff >  3.40  ->  skewness =  0.38   n = 10010

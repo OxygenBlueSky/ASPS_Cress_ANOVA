@@ -4,9 +4,12 @@ This doc covers the scripts written in May 2026 to fold the **remeasured
 ASPS 1-5 cress lengths** (`260506_ASPS1-5_cress_measures.xlsx`) back into the
 project as a parallel **v2 stream**, alongside the original v1 measurements.
 
-The original v1 pipeline (ASPS 1-10 combine → skewness filter → ANOVA / ICC)
-is unchanged. The new scripts live in `cress_combine_files/` and are dated
-`20260506_*`.
+The combine pipeline is now `s1 → s2 → s3` inside `cress_combine_files/`
+(`s1_build_filename_lookup.r`, `s2_import_imagej_remeasured.r`,
+`s3_cress_combine_files_v2.r`), feeding `s4_cress_skewness_check.r` and
+`s5_cress_descriptive_anova.r` in the project root. The legacy v1 combine
+script (`20251022_cress_combine_files.r`) was retired to `OLD/` once its
+output became a frozen artifact consumed by s3.
 
 ---
 
@@ -31,18 +34,29 @@ the existing labelled xlsx files via a filename-based lookup.
 
 ```
 ASPS_Cress_ANOVA/
-├── 260506_ASPS1-5_cress_measures.xlsx     ← INPUT: new ImageJ remeasurement
+├── input_data/                            ← all raw inputs the pipeline reads
+│   ├── 260506_ASPS1-5_cress_measures.xlsx     ← new ImageJ remeasurement
+│   ├── *_labeled.xlsx                          ← 10 hand-labelled v1 files
+│   ├── ASPS1-10-decoding table.csv             ← potency code lookup
+│   ├── cress_length_ASPS_1-10_alldata_decoded.xlsx
+│   │                                            ← v1 frozen artifact (output
+│   │                                             of legacy v1 combine script,
+│   │                                             now in OLD/, not re-run)
+│   ├── 251021_*.xlsx                           ← legacy analysis-ready files
+│   └── … (other source xlsx)
+├── s4_cress_skewness_check.r              ← downstream step 4
+├── s5_cress_descriptive_anova.r           ← downstream step 5
+├── outputs/
+│   ├── <YYYYMMDD>_s4_skewness_<ver>/      ← s4 outputs
+│   └── <YYYYMMDD>_s5_anova_<raw|skewcorr>_<ver>/  ← s5 outputs
 ├── cress_combine_files/
-│   ├── 20251022_cress_combine_files.r     ← v1 combine (existing, unchanged)
-│   ├── 20260506_build_filename_lookup.r   ← STEP 1
-│   ├── 20260506_import_imagej_remeasured.r← STEP 2
-│   ├── 20260506_cress_combine_files_v2.r  ← STEP 3
-│   ├── *_labeled.xlsx                     ← hand-labelled v1 files (input)
-│   ├── ASPS1-10-decoding table.csv        ← potency code lookup
-│   ├── cress_length_ASPS_1-10_alldata_decoded.xlsx ← v1 combined (input)
-│   ├── <YYYYMMDD>_cress_lookup/           ← Step 1 outputs
-│   ├── <YYYYMMDD>_cress_remeasured/       ← Step 2 outputs
-│   └── <YYYYMMDD>_cress_combined/         ← Step 3 outputs
+│   ├── s1_build_filename_lookup.r         ← STEP 1 (reads ../input_data/)
+│   ├── s2_import_imagej_remeasured.r      ← STEP 2 (reads ../input_data/)
+│   ├── s3_cress_combine_files_v2.r        ← STEP 3 (reads ../input_data/)
+│   ├── <YYYYMMDD>_cress_lookup/           ← s1 outputs
+│   ├── <YYYYMMDD>_cress_remeasured/       ← s2 outputs
+│   └── <YYYYMMDD>_cress_combined/         ← s3 outputs
+├── OLD/                                   ← retired scripts and outputs
 └── REMEASUREMENT_PIPELINE.md              ← this file
 ```
 
@@ -90,16 +104,17 @@ and writes its outputs to disk — so you can stop after any step and inspect.
 ```r
 setwd("cress_combine_files")
 
-source("20260506_build_filename_lookup.r")
+source("s1_build_filename_lookup.r")
 # → inspect <date>_cress_lookup/filename_to_bag_lookup_ambiguous.xlsx
 # → inspect <date>_cress_lookup/filename_to_bag_lookup_copies.xlsx
 
-source("20260506_import_imagej_remeasured.r")
+source("s2_import_imagej_remeasured.r")
 # → inspect any "needs_resolution = TRUE" rows in the output
 # → check console for "LASPR > LAGES" and "duplicate Label" warnings
 
-source("20260506_cress_combine_files_v2.r")
-# → final combined file ready for downstream analysis
+source("s3_cress_combine_files_v2.r")
+# → final combined file (ASPS 1-10, v1+v2 streams, with in_v1_analysis
+#   and in_v2_analysis membership flags) ready for downstream s4/s5
 ```
 
 Console output at each step tells you (a) which folder it's writing to,
@@ -108,7 +123,7 @@ passed/were filtered.
 
 ---
 
-## Step 1 — `20260506_build_filename_lookup.r`
+## Step 1 (s1) — `s1_build_filename_lookup.r`
 
 **Purpose.** Build the filename → bag lookup table by reading the 10
 hand-labelled `*_labeled.xlsx` files in `cress_combine_files/`.
@@ -136,7 +151,7 @@ hand-labelled `*_labeled.xlsx` files in `cress_combine_files/`.
 
 ---
 
-## Step 2 — `20260506_import_imagej_remeasured.r`
+## Step 2 (s2) — `s2_import_imagej_remeasured.r`
 
 **Purpose.** Convert the new ImageJ wide-format remeasurement xlsx into a
 long-format dataset matching the v1 schema, with bag/exp/code attached via
@@ -147,7 +162,7 @@ pairing logic and QA checks are kept; the Setup-file machinery is replaced
 by the filename-based lookup.
 
 **Inputs**
-- `../260506_ASPS1-5_cress_measures.xlsx` (the new remeasurement file).
+- `../input_data/260506_ASPS1-5_cress_measures.xlsx` (the new remeasurement file).
 - Most recent `<date>_cress_lookup/filename_to_bag_lookup.xlsx`.
 
 **What it does**
@@ -172,14 +187,16 @@ by the filename-based lookup.
 
 ---
 
-## Step 3 — `20260506_cress_combine_files_v2.r`
+## Step 3 (s3) — `s3_cress_combine_files_v2.r`
 
 **Purpose.** Decode potency on the remeasured rows, drop unresolved rows,
-and bind v1 + v2 into one parallel-stream dataset.
+bind v1 + v2 into one parallel-stream dataset, and tag each row with
+analysis-membership flags so downstream scripts can pick a "view" without
+having to know about provenance.
 
 **Inputs**
-- `cress_length_ASPS_1-10_alldata_decoded.xlsx` (v1, produced by
-  `20251022_cress_combine_files.r`).
+- `cress_length_ASPS_1-10_alldata_decoded.xlsx` (v1 frozen artifact, the
+  output of the legacy v1 combine script now in `OLD/`).
 - Most recent `<date>_cress_remeasured/cress_length_ASPS_1-5_remeasured.xlsx`.
 - `ASPS1-10-decoding table.csv` (same potency lookup as v1).
 
@@ -195,32 +212,57 @@ and bind v1 + v2 into one parallel-stream dataset.
    the count and points to the source file for inspection.
 4. Casts both streams' `bag` to character (v1 stores it as text), then
    `bind_rows()` and arranges by `version, exp_no, bag, count`.
-5. Computes a per-bag repeatability table: for each `(exp_no, bag, potency)`
+5. Adds two boolean membership columns:
+   - `in_v1_analysis` = `version == "v1_original"` (the original ASPS 1-10
+     dataset, untouched).
+   - `in_v2_analysis` = (`version == "v2_remeasured"`) OR
+     (`version == "v1_original"` AND ASPS exp ≥ 6) — i.e. v2 ASPS 1-5 +
+     v1 ASPS 6-10. This is the **best-available** view: remeasured where
+     we have it, original where we don't. ASPS 6-10 was never remeasured
+     so its v1 rows are the canonical v2 data for those experiments.
+6. Computes a per-bag repeatability table: for each `(exp_no, bag, potency)`
    in v2, side-by-side v1/v2 seedling count and mean seedling/sprout/root
    length, pivoted wide.
 
 **Outputs** (in `<YYYYMMDD>_cress_combined/`)
 | File | Contents |
 |---|---|
-| `cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx` | Long-format dataset, v1 + v2 with `version` column. Use this for downstream ANOVA / ICC. |
+| `cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx` | Long-format dataset, v1 + v2 with `version` + `in_v1_analysis` + `in_v2_analysis` columns. Single source of truth for downstream ANOVA / ICC. |
 | `cress_length_ASPS_1-5_repeatability_v1_vs_v2.xlsx` | Per-bag v1 vs v2 means and counts (`n_v1_original` = seedlings in that bag in v1; `n_v2_remeasured` = seedlings in v2). |
 
 ---
 
-## Downstream analysis
+## Downstream analysis (s4 + s5)
 
-To run the existing analysis on the new combined dataset, point the input
-path of `cress_screwness/20251022_check_skewness_adapted.r` and
-`251021_cress_descriptive_ANOVA_graphs.r` at
-`<date>_cress_combined/cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx`,
-and add a `filter()` for the version you want to analyse, e.g.
+The combine pipeline (s1 → s2 → s3) feeds two numbered downstream scripts
+in the project root:
 
-```r
-df <- df %>% filter(version == "v2_remeasured" |
-                    (version == "v1_original" & !exp_no %in% asps_1_5_exp_nos))
-```
+- `s4_cress_skewness_check.r` — picks per-variable left cutoffs to bring
+  the distributions toward symmetry, writes a copy of the dataset with
+  `T<var>_cut<value>` columns appended.
+- `s5_cress_descriptive_anova.r` — bag-level Type-III ANOVA + emmeans
+  post-hoc + 24 normalized boxplots, in three groups (ALL / AS / JZ).
 
-(or simpler — analyse the two streams separately and compare).
+Both scripts use the same conventions:
+
+- A **CONFIG block** at the top of the file. Key knob is
+  `DATASET_VER <- "v1" | "v2" | "v1v2"`. s5 also has
+  `USE_SKEWNESS_CORRECTED <- TRUE/FALSE`.
+- They auto-discover the most recent
+  `cress_combine_files/<date>_cress_combined/` folder and read the v1v2
+  combined xlsx from there. Row selection is by membership flag:
+  `"v1"` → `in_v1_analysis`, `"v2"` → `in_v2_analysis`, `"v1v2"` → no
+  filter (comparison view; biological samples in ASPS 1-5 appear twice,
+  so this is rarely the right ANOVA input).
+- Outputs go to `outputs/<YYYYMMDD>_<scripttag>_<purpose>_<ver>/` and all
+  files inside are named `<YYYYMMDD>_<scripttag>_<ver>_<purpose>.<ext>`.
+  Re-running on a different day creates a new sibling folder; nothing
+  gets overwritten.
+- s5 with `USE_SKEWNESS_CORRECTED=TRUE` walks `outputs/` for the latest
+  matching s4 folder, and swaps `T<var>_cut*` columns back over the
+  corresponding raw column before computing bag-level means.
+
+Originals from the pre-numbered era are in `OLD/`.
 
 ---
 

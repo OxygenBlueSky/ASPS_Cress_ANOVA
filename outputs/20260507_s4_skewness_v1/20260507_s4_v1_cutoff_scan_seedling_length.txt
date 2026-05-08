@@ -1,0 +1,13 @@
+Cutoff scan for seedling_length  (rows with seedling_length > cutoff are kept)
+Initial skewness = -1.57   n = 11463
+  cutoff >  0.00  ->  skewness = -1.57   n = 11463
+  cutoff >  1.00  ->  skewness = -1.55   n = 11460
+  cutoff >  2.00  ->  skewness = -1.50   n = 11446
+  cutoff >  3.00  ->  skewness = -1.42   n = 11412
+  cutoff >  4.00  ->  skewness = -1.28   n = 11314
+  cutoff >  5.00  ->  skewness = -1.03   n = 11136
+  cutoff >  6.00  ->  skewness = -0.79   n = 10945
+  cutoff >  7.00  ->  skewness = -0.53   n = 10684
+  cutoff >  8.00  ->  skewness = -0.21   n = 10255
+  cutoff >  9.00  ->  skewness =  0.11   n = 9504
+  cutoff > 10.00  ->  skewness =  0.53   n = 7828
