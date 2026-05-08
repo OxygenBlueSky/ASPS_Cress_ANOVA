@@ -30,14 +30,15 @@ library(openxlsx)
 library(emmeans)
 library(ggplot2)
 library(gridExtra)
-library(cowplot)
+library(patchwork)  # 2016/2022 grid assembly for the texture-style line plot
+library(plotrix)    # std.error() = sd / sqrt(n) for SE error bars
 
 
 #===== CONFIG ===============================================================
 
 SCRIPT_TAG     <- "s5"
 DATASET_VER    <- "v2"   # "v1" | "v2" | "v1v2"
-USE_SKEWNESS_CORRECTED <- FALSE  # TRUE -> read latest s4 output for DATASET_VER
+USE_SKEWNESS_CORRECTED <- TRUE   # TRUE -> read latest s4 output for DATASET_VER
 RUN_DATE       <- format(Sys.Date(), "%Y%m%d")
 
 # Response variables analysed. When USE_SKEWNESS_CORRECTED is TRUE we look
@@ -234,16 +235,25 @@ bag_inventory_by_exp <- df_bags %>%
 cat("\nPer-experiment summary:\n")
 print.data.frame(bag_inventory_by_exp, row.names = FALSE)
 
-# (2) Full per-bag table. Sorted by experiment, potency code, bag so the
-# eye can scan within an experiment. n = Inf forces the tibble printer to
-# show every row (no "... with N more rows" truncation).
-bag_inventory_full <- df_bags %>%
-  select(experiment_number, experimenter, potency_code, potency,
-         bag, label, n_seeds) %>%
-  arrange(experiment_number, potency_code, bag)
+# (2) Bag x experiment matrix of seed counts. One row per (potency_code,
+# bag), one column per experiment, cells = n_seeds. Empty cells mark bags
+# that don't exist for that experiment, so missing potencies and odd low-
+# count bags are spotted at a glance instead of scrolling a long per-bag
+# list. Rows are sorted by potency order (as it appears in df_bags) and
+# then numeric bag suffix, so bags of the same potency stay adjacent and
+# "Lactose" doesn't get alphabetised out of place.
+potency_order <- unique(df_bags$potency_code)
+bag_matrix <- df_bags %>%
+  mutate(bag_id = paste0(potency_code, bag)) %>%
+  select(experiment_number, bag_id, potency_code, bag, n_seeds) %>%
+  pivot_wider(names_from = experiment_number, values_from = n_seeds) %>%
+  arrange(match(potency_code, potency_order), bag) %>%
+  select(-potency_code, -bag)  # keep bag_id as the row label
 
-cat("\nFull per-bag table (", nrow(bag_inventory_full), " bags):\n", sep = "")
-print(bag_inventory_full, n = Inf)
+cat("\nBag x experiment matrix of seed counts (",
+    nrow(bag_matrix), " bag slots x ",
+    ncol(bag_matrix) - 1, " experiments):\n", sep = "")
+print.data.frame(bag_matrix, row.names = FALSE, na.print = "")
 
 # (3) Totals split by experimenter -- one-line sanity check that AS + JZ
 # add up to the bag-level rows reported above.
@@ -626,6 +636,26 @@ cat("\nWrote post-hoc: ", out_posthoc, "\n", sep = "")
 #   by_potency - one panel per potency,    x-axis = experiment
 # Saved at 300dpi cm so they're print-ready.
 
+# Robust legend extractor. cowplot::get_legend() is fragile across ggplot2
+# major versions: ggplot2 3.5.0 renamed the legend gtable cell from
+# "guide-box" to "guide-box-bottom"/"-right"/..., and ggplot2 4.0 rewrote
+# the guide system again. When cowplot's lookup misses, it returns a half-
+# initialised grob with a NULL viewport path -- which then crashes
+# grid.arrange() later on with
+#   Error in UseMethod("depth"): no applicable method for 'depth'
+#                                applied to an object of class "NULL"
+# To stay version-independent we build the gtable ourselves and grab the
+# first non-empty grob whose layout name starts with "guide-box".
+extract_legend <- function(plot) {
+  g <- ggplot2::ggplotGrob(plot)
+  guide_idx <- which(grepl("^guide-box", g$layout$name))
+  for (i in guide_idx) {
+    grob <- g$grobs[[i]]
+    if (!inherits(grob, "zeroGrob")) return(grob)
+  }
+  grid::nullGrob()  # fallback: shouldn't trigger unless the plot has no legend
+}
+
 # Build a shared bottom legend for a faceted ggplot grid that uses
 # theme(legend.position="none") on the panels themselves.
 build_panel_legend <- function(df_normalized, fill_var, fill_palette,
@@ -639,7 +669,7 @@ build_panel_legend <- function(df_normalized, fill_var, fill_palette,
     theme(legend.position = "bottom",
           legend.title = element_text(size = 10, face = "bold"),
           legend.text  = element_text(size = 9))
-  cowplot::get_legend(p)
+  extract_legend(p)
 }
 
 # Single panel for one experiment OR one potency.
@@ -738,6 +768,321 @@ for (group_key in names(analysis_groups)) {
 }
 
 
+#===== PLOTS: mean +/- SE line plots (2016 vs 2022, texture style) ==========
+
+# Companion figure to the boxplots above. Layout mirrors the ASPS texture/
+# fractal output: rows = response variables, columns = experimenter cohort
+# (2016/AS exp 1-5 left, 2022/JZ exp 6-10 right). Within a row both columns
+# share y-limits so the two cohorts are directly comparable; the right column
+# drops its y-axis to give the panels more horizontal room.
+#
+# Each point is the (experiment, remedy) bag-level mean and the error bar is
+# +/- 1 SE across bags within that cell (SE = sd / sqrt(n_bags)). The error
+# bars therefore represent bag-to-bag variability, NOT seed-to-seed -- this
+# is intentional: the bag is the experimental unit and seed-level SE would
+# pseudoreplicate (see s6 ICC for the pseudoreplication penalty).
+#
+# x-axis is numeric experiment_number so any missing experiment leaves a
+# real gap (e.g. if exp 4 is absent for AS in the current DATASET_VER, the
+# AS line skips that x position). Lines connect points of the same remedy
+# across experiments to make trajectories easier to read.
+
+# Texture-script palette and remedy display order. Keys must match the
+# spelling in df_bags$potency exactly -- the s3 decoder writes "Ars. album"
+# (space + lowercase a), not "Ars.Album".
+potency_hierarchy <- c("Lactose", "Stannum", "Silicea", "Sulphur",
+                       "Ars. album", "Mercury")
+potency_colors <- c(
+  "Lactose"    = "#51CFFD",
+  "Stannum"    = "#FFC72C",
+  "Silicea"    = "#E7298A",
+  "Sulphur"    = "#9100AB",
+  "Ars. album" = "#00BD5F",
+  "Mercury"    = "#919191"
+)
+
+# Aggregate bag-level rows to one mean +/- SE per (cohort, experiment, remedy).
+# experiment_number was factorised at the ANOVA stage; convert back to integer
+# here so the x-axis can be numeric (real gaps for missing experiments).
+df_lineplot <- df_bags %>%
+  mutate(
+    experiment_number  = as.integer(as.character(experiment_number)),
+    potency            = as.character(potency),
+    experimenter_label = ifelse(experimenter == "AS",
+                                "2016 data (Experiments 1-5)",
+                                "2022 data (Experiments 6-10)")
+  ) %>%
+  group_by(experimenter_label, experiment_number, potency) %>%
+  summarise(
+    across(all_of(response_vars),
+           list(mean = ~mean(.x, na.rm = TRUE),
+                se   = ~plotrix::std.error(.x, na.rm = TRUE))),
+    n_bags = n(),
+    .groups = "drop"
+  ) %>%
+  # Lock factor order so the legend follows potency_hierarchy and the colour
+  # mapping by name is unambiguous.
+  mutate(potency = factor(potency, levels = potency_hierarchy))
+
+# Per-measure y-limits computed across BOTH cohorts so the 2016 and 2022
+# panels in the same row line up. Extend the range by 5% top and bottom so
+# error bars don't kiss the panel edge.
+y_limits <- lapply(response_vars, function(v) {
+  mn  <- df_lineplot[[paste0(v, "_mean")]]
+  se  <- df_lineplot[[paste0(v, "_se")]]
+  lo  <- min(mn - se, na.rm = TRUE)
+  hi  <- max(mn + se, na.rm = TRUE)
+  pad <- 0.05 * (hi - lo)
+  c(lo - pad, hi + pad)
+})
+names(y_limits) <- response_vars
+
+# Build one ggplot per (measure, cohort). Two nested loops -> 4 * 2 = 8
+# panels in row-major order, which patchwork::wrap_plots(ncol = 2) lays out
+# as the requested 4-row x 2-column grid.
+cohort_labels <- c("2016 data (Experiments 1-5)",
+                   "2022 data (Experiments 6-10)")
+
+plot_list <- list()
+for (var in response_vars) {
+  for (col_idx in seq_along(cohort_labels)) {
+    cohort <- cohort_labels[col_idx]
+    panel_data <- df_lineplot %>% filter(experimenter_label == cohort)
+
+    p <- ggplot(panel_data,
+                aes(x     = experiment_number,
+                    y     = .data[[paste0(var, "_mean")]],
+                    color = potency,
+                    group = potency)) +
+      geom_line(position = position_dodge(width = 0.3)) +
+      geom_point(position = position_dodge(width = 0.3), size = 2) +
+      geom_errorbar(aes(ymin = .data[[paste0(var, "_mean")]] -
+                                .data[[paste0(var, "_se")]],
+                        ymax = .data[[paste0(var, "_mean")]] +
+                                .data[[paste0(var, "_se")]]),
+                    width = 0.3,
+                    position = position_dodge(width = 0.3)) +
+      scale_color_manual(values = potency_colors,
+                         breaks = potency_hierarchy,
+                         name   = "Remedy") +
+      scale_y_continuous(limits = y_limits[[var]]) +
+      scale_x_continuous(breaks = 1:10) +
+      labs(title = cohort, y = var, x = "Experiment Number") +
+      theme_bw() +
+      theme(
+        plot.title         = element_text(size = 15, face = "bold"),
+        axis.title         = element_text(size = 14),
+        axis.text          = element_text(size = 13),
+        legend.title       = element_text(size = 13),
+        legend.text        = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank()
+      )
+
+    if (col_idx == 1) {
+      # Left (2016): hide legend (right column carries it), tighter right
+      # margin so the two columns sit close together.
+      p <- p + theme(legend.position = "none",
+                     plot.margin     = margin(t = 5, r = 2, b = 5, l = 5))
+    } else {
+      # Right (2022): drop y-axis -- shared scale is already shown on the
+      # left -- and tighten left margin to mirror the gap on the other side.
+      p <- p + theme(axis.title.y = element_blank(),
+                     axis.text.y  = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     plot.margin  = margin(t = 5, r = 5, b = 5, l = 2))
+    }
+
+    plot_list[[length(plot_list) + 1]] <- p
+  }
+}
+
+# Assemble the 4 x 2 grid. patchwork auto-aligns panel widths and heights so
+# the shared-y-limit pairs in each row line up cleanly.
+grid_plot <- patchwork::wrap_plots(plot_list,
+                                   ncol = 2,
+                                   nrow = length(response_vars)) +
+  patchwork::plot_annotation(
+    title    = "ASPS Cress Analysis: All six potencies",
+    subtitle = paste0("Mean +/- SE across bags (n_bags varies per cell); ",
+                      "dataset version: ", DATASET_VER),
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 18, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5)
+    )
+  )
+
+# Output sized like the texture script: 30 cm wide, 8.2 cm per row plus a
+# 5 cm header allowance for title + subtitle.
+out_lineplot <- out_path("lineplot_2016_vs_2022_all_measures", "png")
+ggsave(filename = out_lineplot,
+       plot     = grid_plot,
+       width    = 30,
+       height   = 5 + length(response_vars) * 8.2,
+       units    = "cm",
+       dpi      = 300)
+cat("\nWrote line plot: ", out_lineplot, "\n", sep = "")
+
+
+#===== PLOTS: lactose-standardised line plots (divide by lactose mean) ======
+
+# Same layout as the previous figure, but each bag value is first divided by
+# its own experiment's Lactose-bag mean. After standardisation Lactose is 1.0
+# by construction, so it's dropped from the plotted remedies and replaced by
+# a dashed grey reference line at y = 1. The reference line gets its own
+# legend entry via a constant linetype mapping ("Lactose baseline") and a
+# matching scale_linetype_manual() call -- this is the standard ggplot
+# trick for putting a non-aesthetic geom into the legend cleanly.
+#
+# Standardisation is done at bag level BEFORE aggregation: for each
+# (experimenter, experiment_number) cell we compute the mean of Lactose bags
+# in that cell and divide every bag in that cell by it. Mean +/- SE are then
+# computed on the standardised bag values, so error bars again represent
+# bag-to-bag variability (now relative to the local Lactose baseline).
+
+baseline_value <- 1  # divide mode -> Lactose collapses to 1.0
+
+# Standardise at bag level, per experiment.
+df_bags_std <- df_bags %>%
+  mutate(
+    experiment_number = as.integer(as.character(experiment_number)),
+    potency           = as.character(potency)
+  ) %>%
+  group_by(experimenter, experiment_number) %>%
+  mutate(across(all_of(response_vars),
+                ~ {
+                  lac_mean <- mean(.x[potency == "Lactose"], na.rm = TRUE)
+                  .x / lac_mean
+                })) %>%
+  ungroup()
+
+# Aggregate the standardised bag values to (cohort, experiment, remedy).
+# Lactose is dropped because it sits on the dashed baseline by construction.
+df_lineplot_std <- df_bags_std %>%
+  filter(potency != "Lactose") %>%
+  mutate(experimenter_label = ifelse(experimenter == "AS",
+                                     "2016 data (Experiments 1-5)",
+                                     "2022 data (Experiments 6-10)")) %>%
+  group_by(experimenter_label, experiment_number, potency) %>%
+  summarise(
+    across(all_of(response_vars),
+           list(mean = ~mean(.x, na.rm = TRUE),
+                se   = ~plotrix::std.error(.x, na.rm = TRUE))),
+    n_bags = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(potency = factor(potency,
+                          levels = setdiff(potency_hierarchy, "Lactose")))
+
+# Per-measure y-limits across both cohorts. Force the baseline value into
+# the range so the dashed Lactose reference line is always visible even
+# when all other remedies sit far above or below 1.
+y_limits_std <- lapply(response_vars, function(v) {
+  mn  <- df_lineplot_std[[paste0(v, "_mean")]]
+  se  <- df_lineplot_std[[paste0(v, "_se")]]
+  lo  <- min(c(mn - se, baseline_value), na.rm = TRUE)
+  hi  <- max(c(mn + se, baseline_value), na.rm = TRUE)
+  pad <- 0.05 * (hi - lo)
+  c(lo - pad, hi + pad)
+})
+names(y_limits_std) <- response_vars
+
+# Legend breaks for the colour scale: hierarchy minus Lactose so it doesn't
+# appear as a colour swatch (Lactose is represented by the dashed line, not
+# a colour).
+legend_breaks_std <- setdiff(potency_hierarchy, "Lactose")
+
+plot_list_std <- list()
+for (var in response_vars) {
+  for (col_idx in seq_along(cohort_labels)) {
+    cohort     <- cohort_labels[col_idx]
+    panel_data <- df_lineplot_std %>% filter(experimenter_label == cohort)
+
+    p <- ggplot(panel_data,
+                aes(x     = experiment_number,
+                    y     = .data[[paste0(var, "_mean")]],
+                    color = potency,
+                    group = potency)) +
+      # Dashed grey reference at the lactose baseline. Mapping linetype to a
+      # constant string puts this geom into its own legend entry; the actual
+      # dashed style is set by scale_linetype_manual() below.
+      geom_hline(aes(yintercept = baseline_value,
+                     linetype   = "Lactose baseline"),
+                 color = "grey40", linewidth = 0.4) +
+      geom_line(position = position_dodge(width = 0.3)) +
+      geom_point(position = position_dodge(width = 0.3), size = 2) +
+      geom_errorbar(aes(ymin = .data[[paste0(var, "_mean")]] -
+                                .data[[paste0(var, "_se")]],
+                        ymax = .data[[paste0(var, "_mean")]] +
+                                .data[[paste0(var, "_se")]]),
+                    width = 0.3,
+                    position = position_dodge(width = 0.3)) +
+      scale_color_manual(values = potency_colors,
+                         breaks = legend_breaks_std,
+                         name   = "Remedy") +
+      # Second legend block for the dashed baseline. name = NULL keeps it
+      # header-less so it sits cleanly under the Remedy legend.
+      scale_linetype_manual(name   = NULL,
+                            values = c("Lactose baseline" = "dashed")) +
+      # Force legend stacking order: Remedy on top (order = 1), dashed
+      # Lactose baseline below it (order = 2). Without this, ggplot picks
+      # its own order across aesthetics and the baseline can land on top.
+      guides(color    = guide_legend(order = 1),
+             linetype = guide_legend(order = 2)) +
+      scale_y_continuous(limits = y_limits_std[[var]]) +
+      scale_x_continuous(breaks = 1:10) +
+      labs(title = cohort,
+           y     = paste0(var, "\n(/ lactose mean)"),
+           x     = "Experiment Number") +
+      theme_bw() +
+      theme(
+        plot.title         = element_text(size = 15, face = "bold"),
+        axis.title         = element_text(size = 14),
+        axis.text          = element_text(size = 13),
+        legend.title       = element_text(size = 13),
+        legend.text        = element_text(size = 12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank()
+      )
+
+    if (col_idx == 1) {
+      p <- p + theme(legend.position = "none",
+                     plot.margin     = margin(t = 5, r = 2, b = 5, l = 5))
+    } else {
+      p <- p + theme(axis.title.y = element_blank(),
+                     axis.text.y  = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     plot.margin  = margin(t = 5, r = 5, b = 5, l = 2))
+    }
+
+    plot_list_std[[length(plot_list_std) + 1]] <- p
+  }
+}
+
+grid_plot_std <- patchwork::wrap_plots(plot_list_std,
+                                       ncol = 2,
+                                       nrow = length(response_vars)) +
+  patchwork::plot_annotation(
+    title    = "ASPS Cress Analysis (lactose-standardised, divide): All six potencies",
+    subtitle = paste0("Each bag value = (treatment / per-experiment lactose mean); ",
+                      "dashed line = lactose baseline (1); ",
+                      "dataset version: ", DATASET_VER),
+    theme    = theme(
+      plot.title    = element_text(face = "bold", size = 18, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5)
+    )
+  )
+
+out_lineplot_std <- out_path("lineplot_2016_vs_2022_lactose_std_divide", "png")
+ggsave(filename = out_lineplot_std,
+       plot     = grid_plot_std,
+       width    = 30,
+       height   = 5 + length(response_vars) * 8.2,
+       units    = "cm",
+       dpi      = 300)
+cat("Wrote lactose-std line plot: ", out_lineplot_std, "\n", sep = "")
+
+
 #===== SUMMARY ==============================================================
 
 cat("\n\n", strrep("#", 80), "\n", sep = "")
@@ -747,6 +1092,8 @@ cat("Output folder: ", out_dir, "\n", sep = "")
 cat("ANOVA xlsx   : ", basename(out_anova), "\n", sep = "")
 cat("Post-hoc xlsx: ", basename(out_posthoc), "\n", sep = "")
 cat("Plots        : 24 PNG files (4 vars * 3 groups * 2 layouts)\n")
+cat("Line plot    : ", basename(out_lineplot), "\n", sep = "")
+cat("Line plot std: ", basename(out_lineplot_std), "\n", sep = "")
 for (group_key in names(analysis_groups)) {
   cat(sprintf("  %s: %d bags\n", group_key, nrow(analysis_groups[[group_key]]$data)))
 }
