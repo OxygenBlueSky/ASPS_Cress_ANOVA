@@ -201,6 +201,66 @@ cat("\nBag-level rows: ", nrow(df_bags),
     " seeds/bag, range ", min(df_bags$n_seeds),
     "-", max(df_bags$n_seeds), ")\n", sep = "")
 
+
+#===== BAG INVENTORY ========================================================
+
+# Full enumeration of every bag that survives into df_bags, with the seed
+# count per bag. Two views are printed:
+#   (1) per-experiment summary  -- quick check that all 10 experiments are
+#       present and that AS (1-5) / JZ (6-10) bag counts look right.
+#   (2) full per-bag table      -- every bag in the run, no truncation, so
+#       odd bags (very low n_seeds, missing potencies) are easy to spot.
+# Uses df_bags before factorisation so experiment_number / potency_code /
+# bag still sort naturally as numbers/characters.
+
+cat("\n", strrep("#", 80), "\n", sep = "")
+cat("BAG INVENTORY (dataset feeding this run)\n")
+cat(strrep("#", 80), "\n", sep = "")
+
+# (1) Per-experiment summary: how many bags and seeds per experiment, and
+# the spread of seeds-per-bag within that experiment.
+bag_inventory_by_exp <- df_bags %>%
+  group_by(experimenter, experiment_number) %>%
+  summarise(
+    n_bags        = n(),
+    n_seeds_total = sum(n_seeds),
+    mean_seeds    = round(mean(n_seeds), 1),
+    min_seeds     = min(n_seeds),
+    max_seeds     = max(n_seeds),
+    .groups       = "drop"
+  ) %>%
+  arrange(experimenter, experiment_number)
+
+cat("\nPer-experiment summary:\n")
+print.data.frame(bag_inventory_by_exp, row.names = FALSE)
+
+# (2) Full per-bag table. Sorted by experiment, potency code, bag so the
+# eye can scan within an experiment. n = Inf forces the tibble printer to
+# show every row (no "... with N more rows" truncation).
+bag_inventory_full <- df_bags %>%
+  select(experiment_number, experimenter, potency_code, potency,
+         bag, label, n_seeds) %>%
+  arrange(experiment_number, potency_code, bag)
+
+cat("\nFull per-bag table (", nrow(bag_inventory_full), " bags):\n", sep = "")
+print(bag_inventory_full, n = Inf)
+
+# (3) Totals split by experimenter -- one-line sanity check that AS + JZ
+# add up to the bag-level rows reported above.
+bag_totals <- df_bags %>%
+  group_by(experimenter) %>%
+  summarise(
+    n_bags        = n(),
+    n_seeds_total = sum(n_seeds),
+    .groups       = "drop"
+  )
+
+cat("\nTotals by experimenter:\n")
+print.data.frame(bag_totals, row.names = FALSE)
+cat("Grand total: ", nrow(df_bags), " bags, ",
+    sum(df_bags$n_seeds), " seeds\n", sep = "")
+
+
 # Factorise grouping vars so Anova(type="III") gets the right contrasts.
 df_bags$experiment_number <- as.factor(df_bags$experiment_number)
 df_bags$potency           <- as.factor(df_bags$potency)
