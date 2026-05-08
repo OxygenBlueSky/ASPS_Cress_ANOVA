@@ -30,6 +30,40 @@ the existing labelled xlsx files via a filename-based lookup.
 
 ---
 
+## Where ASPS 6-10 comes from (heads up)
+
+> ⚠️ **The current s1 → s2 → s3 pipeline does not re-derive ASPS 6-10.** It
+> reads them straight from the frozen v1 artifact
+> `input_data/cress_length_ASPS_1-10_alldata_decoded.xlsx`. That file is the
+> *output* of the retired legacy combiner
+> (`OLD/20251022_cress_combine_files_v1.r`), which read the canonical raw
+> JZ source `input_data/only_combined_data_Kresselaenge_ASPS_6-10_SL.xlsx`,
+> applied LASPR1/2 / LAGES1/2 halving, recalculated `root = seedling -
+> sprout`, and decoded potencies. Once produced, the combined xlsx was
+> treated as immutable.
+
+**Practical consequences**
+
+- Any data issue in ASPS 6-10 (filename ↔ bag-tag mismatches, duplicate
+  rows, etc.) lives in `only_combined_data_Kresselaenge_ASPS_6-10_SL.xlsx`
+  and propagates verbatim through the pipeline. Known cases as of
+  2026-05-08:
+  - ASPS 6 potencies B and D: filename suffix (`B_001..B_012`,
+    `D_001..D_014`) does not line up with the `bag` column
+    (`B_4..B_15`, `D_2..D_15`). Cosmetic; doesn't affect the analysis.
+  - `6_A_9` ≡ `6_A_10` and `6_C_10` ≡ `6_C_11`: identical measurements,
+    different photos — copy-paste artifacts. To be dropped (separate task).
+- s3 has no knowledge of ASPS 6-10's raw source. To regenerate the frozen
+  file you'd need to resurrect the legacy combiner from `OLD/`.
+- `in_v2_analysis` deliberately falls back to v1 rows for ASPS 6-10 (see
+  s3 step 5 below) because no remeasurement exists for those experiments.
+  So the v2 analysis view is "remeasured ASPS 1-5 + original ASPS 6-10".
+
+If we ever want ASPS 6-10 to be reproducible from raw inputs the same way
+ASPS 1-5 is, that's a planned-but-not-done refactor.
+
+---
+
 ## File layout
 
 ```

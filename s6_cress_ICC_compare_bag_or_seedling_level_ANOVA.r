@@ -1,91 +1,188 @@
-# ASPS Cress Length Analysis - Seedling-Level with ICC Quantification
-# Compares bag-level vs seedling-level analysis
-# Quantifies intraclass correlation and design effects
-# Date: 2025-10-21 14:30
+# s6_cress_ICC_compare_bag_or_seedling_level_ANOVA.r
 #
-# Purpose: Demonstrate pseudoreplication effects when treating seedlings as independent
-# WARNING: Seedling-level analysis inflates Type I error due to non-independence
+# Pipeline step 6: quantify pseudoreplication. For each analysis group
+# (ALL / AS / JZ) and each response variable, compute the intraclass
+# correlation (ICC) of seedlings within bags, then run two ANOVAs side
+# by side -- one on bag means (correct) and one on raw seedlings (wrong)
+# -- so the inflation of significance from ignoring within-bag clustering
+# is visible in the printed p-values.
+#
+# Why: the bag is the experimental unit (potency was applied per bag,
+# ~16 seeds per bag). s5 already runs the bag-level ANOVA; this script
+# documents *how bad* the seed-level shortcut would have been by showing
+# ICC, design effect (DEFF), effective N, and the p-value ratio between
+# the two analyses.
+#
+# Design: one-way random-effects ICC via ICC::ICCbare with bag_id as the
+# cluster. ANOVAs are Type-III SS with contr.sum so the interaction is
+# coded consistently with s5. Three analysis groups: ALL (1-10),
+# AS (1-5), JZ (6-10).
+#
+# Inputs : either the s3 v1v2 combined file (raw) or an s4 skewness-
+#          corrected file, depending on USE_SKEWNESS_CORRECTED. Either way
+#          the file carries in_v1_analysis / in_v2_analysis flags written
+#          by s3 (preserved through s4); rows are filtered by DATASET_VER
+#          using those flags, exactly like s5. "v2" is the hybrid stream
+#          (v2_remeasured for ASPS 1-5, v1_original for ASPS 6-10) and is
+#          the default analysis stream.
+# Outputs: a single PNG of seedling-level distribution histograms
+#          (4 vars x AS/JZ panels) into outputs/<run_dir>/. ICC and ANOVA
+#          comparison results are printed to the console only -- this
+#          script is diagnostic, not a results-producing step.
 
-
-# Libraries
 
 library(readxl)
-library(car)
+library(car)        # Anova(type="III")
 library(here)
 library(dplyr)
 library(tidyr)
 library(ICC)
+library(ggplot2)
+library(gridExtra)
 
 
-# Determine export date
+#===== CONFIG ===============================================================
 
-date <- Sys.Date() 
-date2 <- gsub("-| |UTC", "", date)
+SCRIPT_TAG     <- "s6"
+DATASET_VER    <- "v2"     # "v1" | "v2" | "v1v2"  -- matches s5 semantics
+USE_SKEWNESS_CORRECTED <- TRUE  # TRUE -> read latest s4 output for DATASET_VER
+RUN_DATE       <- format(Sys.Date(), "%Y%m%d")
+
+# Response variables analysed. When USE_SKEWNESS_CORRECTED is TRUE we swap
+# the matching T<var>_cut* truncated column over the raw column below, so
+# the rest of the script (ICC, ANOVAs, histograms) operates on the same
+# truncated values s5 uses for the skew-corrected ANOVA.
+response_vars <- c("sprout_length", "root_length",
+                   "seedling_length", "root_sprout_ratio")
+
+# Inputs.
+INPUT_S3_BASENAME <- "cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx"
+INPUT_S3_PARENT   <- "cress_combine_files"  # holds <date>_cress_combined/
+S4_OUTPUTS_ROOT   <- "outputs"               # holds <date>_s4_skewness_<ver>/
 
 
-# Read data
+#===== DERIVED PATHS (don't edit) ===========================================
 
-cat("\n")
-cat(strrep("=", 80), "\n")
-cat("READING DATA\n")
-cat(strrep("=", 80), "\n")
+SCRIPT_PURPOSE <- paste0("icc_",
+                         if (USE_SKEWNESS_CORRECTED) "skewcorr" else "raw")
 
-# ---- Input toggle --------------------------------------------------------
-# Switch between v1-only (legacy) and the v1+v2 combined file from the
-# remeasurement pipeline. ASPS 1-5 was remeasured in May 2026 because the
-# original v1 measurements used a non-standard protocol; v2 is the corrected
-# stream. v2 only exists for ASPS 1-5, so when use_v1v2 = TRUE we run a
-# hybrid filter below that takes v2 for ASPS 1-5 and keeps v1 for ASPS 6-10.
-# When the skewness-corrected v1v2 file is produced later, just point
-# input_v1v2 at it — no other code changes needed.
-use_v1v2 <- TRUE   # FALSE = legacy v1-only path
-
-input_v1_only <- "251021_cress_length_ASPS_1-10_alldata_skewness_corr_handfiltered.xlsx"
-input_v1v2    <- file.path(
-  "cress_combine_files",
-  "20260507_cress_combined",
-  "cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx"
+out_dir <- file.path(
+  "outputs",
+  paste(RUN_DATE, SCRIPT_TAG, SCRIPT_PURPOSE, DATASET_VER, sep = "_")
 )
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-filename <- if (use_v1v2) input_v1v2 else input_v1_only
-df_raw   <- read_excel(here(filename), sheet = "Sheet 1")
-
-cat("Raw data loaded:\n")
-cat("  Source file:", filename, "\n")
-cat("  Total observations (individual seeds):", nrow(df_raw), "\n")
-cat("  Variables:", paste(colnames(df_raw), collapse = ", "), "\n")
-
-# Hybrid stream selection: keep v2_remeasured rows for ASPS 1-5 and
-# v1_original rows for the experiments NOT covered by v2 (ASPS 6-10). This
-# mirrors the recommended pattern in REMEASUREMENT_PIPELINE.md. Guarded on
-# the presence of a `version` column so the legacy v1-only file still works.
-if ("version" %in% colnames(df_raw)) {
-  asps_1_5_exp_nos <- df_raw %>%
-    filter(version == "v2_remeasured") %>%
-    pull(exp_no) %>%
-    unique()
-
-  df_raw <- df_raw %>%
-    filter(
-      version == "v2_remeasured" |
-      (version == "v1_original" & !exp_no %in% asps_1_5_exp_nos)
-    )
-
-  cat(sprintf(
-    "Hybrid stream selected: v2 for %d ASPS 1-5 exp_no values, v1 for the rest.\n",
-    length(asps_1_5_exp_nos)
-  ))
-  cat("Per-version row counts after hybrid filter:\n")
-  print(table(df_raw$version))
+out_path <- function(suffix, ext) {
+  file.path(
+    out_dir,
+    paste0(RUN_DATE, "_", SCRIPT_TAG, "_", DATASET_VER, "_", suffix, ".", ext)
+  )
 }
 
 
-# Parse experiment number and potency code
+#===== RESOLVE INPUT ========================================================
 
-cat("\n")
-cat(strrep("=", 80), "\n")
-cat("PARSING EXPERIMENT AND POTENCY\n")
-cat(strrep("=", 80), "\n")
+# Two cases, picked by USE_SKEWNESS_CORRECTED:
+#   FALSE -> raw s3 file: most-recent <date>_cress_combined/ under
+#            cress_combine_files/.
+#   TRUE  -> skewness-corrected: most-recent <date>_s4_skewness_<DATASET_VER>/
+#            under outputs/, picking its *_skewness_corr.xlsx.
+# Both helpers are copied verbatim from s5 so the two scripts stay in sync.
+resolve_s3 <- function() {
+  combined_root <- here(INPUT_S3_PARENT)
+  candidates <- sort(
+    list.dirs(combined_root, full.names = FALSE, recursive = FALSE),
+    decreasing = TRUE
+  )
+  candidates <- candidates[grepl("_cress_combined$", candidates)]
+  for (d in candidates) {
+    p <- file.path(combined_root, d, INPUT_S3_BASENAME)
+    if (file.exists(p)) return(p)
+  }
+  stop("No ", INPUT_S3_BASENAME, " found under ", combined_root,
+       "/*_cress_combined/. Run s3_cress_combine_files_v2.r first.")
+}
+
+resolve_s4 <- function(version) {
+  outputs_root <- here(S4_OUTPUTS_ROOT)
+  if (!dir.exists(outputs_root)) {
+    stop("USE_SKEWNESS_CORRECTED=TRUE but ", outputs_root,
+         " does not exist. Run s4 first.")
+  }
+  pattern <- paste0("^[0-9]{8}_s4_skewness_", version, "$")
+  candidates <- sort(
+    list.dirs(outputs_root, full.names = FALSE, recursive = FALSE),
+    decreasing = TRUE
+  )
+  candidates <- candidates[grepl(pattern, candidates)]
+  for (d in candidates) {
+    files <- list.files(file.path(outputs_root, d),
+                        pattern = "_skewness_corr\\.xlsx$",
+                        full.names = TRUE)
+    if (length(files) > 0) return(files[1])
+  }
+  stop("No s4 skewness_corr.xlsx found for DATASET_VER=", version,
+       ". Run s4 with that DATASET_VER first.")
+}
+
+input_path <- if (USE_SKEWNESS_CORRECTED) {
+  resolve_s4(DATASET_VER)
+} else {
+  resolve_s3()
+}
+
+
+#===== READ DATA ============================================================
+
+cat("\n", strrep("=", 80), "\n", sep = "")
+cat("READING DATA\n")
+cat(strrep("=", 80), "\n", sep = "")
+cat("Input         : ", input_path, "\n", sep = "")
+cat("Dataset ver   : ", DATASET_VER, "\n", sep = "")
+cat("Skewness corr : ", USE_SKEWNESS_CORRECTED, "\n", sep = "")
+cat("Output folder : ", out_dir, "\n\n", sep = "")
+
+df_raw <- read_excel(input_path, sheet = "Sheet 1")
+
+# Filter by dataset version using the membership flags written by s3
+# (and preserved through s4). "v2" is the hybrid stream (v2_remeasured for
+# ASPS 1-5, v1_original for ASPS 6-10); "v1" is the original measurements
+# only; "v1v2" keeps every row so ASPS 1-5 appear twice -- comparison
+# view, not an analysis input.
+df_raw <- switch(DATASET_VER,
+  "v1"   = df_raw[df_raw$in_v1_analysis, ],
+  "v2"   = df_raw[df_raw$in_v2_analysis, ],
+  "v1v2" = df_raw,
+  stop("DATASET_VER must be 'v1', 'v2', or 'v1v2'; got: ", DATASET_VER)
+)
+cat("Total seed-level rows after filter: ", nrow(df_raw), "\n", sep = "")
+
+
+#===== SWAP TO TRUNCATED COLUMNS WHEN USING SKEWNESS-CORRECTED INPUT ========
+
+# s4 appends T<var>_cut<value> truncated columns rather than overwriting
+# the originals. Copy the truncated column back over the original name for
+# every response_var that has a truncated counterpart so the rest of the
+# script (ICC, ANOVA, histograms) operates on the same values s5 used.
+# Variables without a truncated column (e.g. root_sprout_ratio) flow
+# through unchanged. Mirrors the equivalent block in s5.
+if (USE_SKEWNESS_CORRECTED) {
+  for (var in response_vars) {
+    trunc_cols <- grep(paste0("^T", var, "_cut"),
+                       colnames(df_raw), value = TRUE)
+    if (length(trunc_cols) >= 1) {
+      df_raw[[var]] <- df_raw[[trunc_cols[1]]]
+      cat("  swapped ", var, " <- ", trunc_cols[1], "\n", sep = "")
+    }
+  }
+}
+
+
+#===== PARSE EXPERIMENT AND POTENCY =========================================
+
+# exp_no is e.g. "3_A": <experiment_number>_<potency_code>. Split that
+# out, tag rows AS / JZ by experimenter for the by-operator analysis,
+# and build a unique bag_id used as the ICC cluster variable.
 
 df_seedlings <- df_raw %>%
   separate(exp_no, into = c("experiment_number", "potency_code"), 
@@ -103,10 +200,11 @@ cat("  Total seedlings:", nrow(df_seedlings), "\n")
 cat("  Total bags:", length(unique(df_seedlings$bag_id)), "\n")
 
 
-# Calculate bag-level means for comparison
+#===== CALCULATE BAG-LEVEL MEANS ============================================
 
-response_vars <- c("sprout_length", "root_length", "seedling_length", "root_sprout_ratio")
-
+# Average per bag so the bag-level ANOVA below treats the bag as the
+# experimental unit (correct), while the seedling-level ANOVA reuses
+# df_seedlings (incorrect, by design -- that's the comparison we want).
 df_bags <- df_seedlings %>%
   group_by(experiment_number, experimenter, potency_code, potency, bag, bag_id, exp_no, label) %>%
   summarise(
@@ -122,7 +220,7 @@ cat("  Bag-level dataset:", nrow(df_bags), "bags\n")
 cat("  Mean seeds per bag:", round(mean(df_bags$n_seeds), 1), "\n")
 
 
-# Convert to factors for ANOVA
+#===== FACTORISE FOR ANOVA ==================================================
 
 df_seedlings$experiment_number <- as.factor(df_seedlings$experiment_number)
 df_seedlings$potency <- as.factor(df_seedlings$potency)
@@ -134,8 +232,12 @@ df_bags$potency <- as.factor(df_bags$potency)
 df_bags$experimenter <- as.factor(df_bags$experimenter)
 
 
-# Define analysis groups
+#===== ANALYSIS GROUPS ======================================================
 
+# ALL splits the data by experimenter to expose any operator-level
+# difference (AS ran ASPS 1-5, JZ ran ASPS 6-10). Each group carries both
+# its bag-level and seedling-level dataset so the loops below can hit them
+# without re-filtering.
 analysis_groups <- list(
   ALL = list(
     name = "ALL DATA (ASPS 1-10)",
@@ -155,8 +257,14 @@ analysis_groups <- list(
 )
 
 
-# Calculate Intraclass Correlation Coefficient (ICC)
+#===== INTRACLASS CORRELATION COEFFICIENT (ICC) =============================
 
+# ICC = between-bag variance / total variance, computed via ICC::ICCbare
+# under a one-way random-effects model with bag_id as the cluster. The
+# design effect DEFF = 1 + (avg cluster size - 1) * ICC tells us how much
+# the standard errors are inflated when we (wrongly) treat seedlings as
+# independent; effective N = actual N / DEFF gives the equivalent
+# independent-sample size. DEFF > 2 is a strong pseudoreplication signal.
 cat("\n\n")
 cat(strrep("#", 80), "\n")
 cat("INTRACLASS CORRELATION COEFFICIENT (ICC) ANALYSIS\n")
@@ -246,8 +354,14 @@ for (group_key in names(analysis_groups)) {
 }
 
 
-# ANOVA Comparison: Bag-level vs Seedling-level
+#===== ANOVA COMPARISON: BAG-LEVEL vs SEEDLING-LEVEL ========================
 
+# Same Type-III ANOVA on the same formula run twice -- once on bag means
+# (correct), once on raw seedlings (pseudoreplicated). The seed-level
+# p-values should be smaller because the inflated N pretends we have more
+# independent information than we do; the printed ratio quantifies that
+# inflation. contr.sum is set globally so the interaction term is testable
+# independently of cell coding (matches s5).
 cat("\n\n")
 cat(strrep("#", 80), "\n")
 cat("ANOVA COMPARISON: BAG-LEVEL vs SEEDLING-LEVEL\n")
@@ -356,35 +470,34 @@ for (group_key in names(analysis_groups)) {
                 p_int_bags / p_int_seedlings,
                 (1 - p_int_seedlings / p_int_bags) * 100))
     
-    # Check for spurious significance
+    # Flag terms that flip from non-significant (bag-level, correct) to
+    # significant (seedling-level, pseudoreplicated). These are the
+    # textbook pseudoreplication false positives that motivate s5
+    # running on bag means.
     if (p_pot_seedlings < 0.05 && p_pot_bags >= 0.05) {
-      cat("\n  ⚠️  ALERT: Potency effect significant at seedling-level but NOT at bag-level!\n")
-      cat("      This is likely a FALSE POSITIVE due to pseudoreplication.\n")
+      cat("\n  ALERT: Potency effect significant at seedling-level but NOT at bag-level.\n")
+      cat("         Likely false positive due to pseudoreplication.\n")
     }
     if (p_int_seedlings < 0.05 && p_int_bags >= 0.05) {
-      cat("\n  ⚠️  ALERT: Interaction significant at seedling-level but NOT at bag-level!\n")
-      cat("      This is likely a FALSE POSITIVE due to pseudoreplication.\n")
+      cat("\n  ALERT: Interaction significant at seedling-level but NOT at bag-level.\n")
+      cat("         Likely false positive due to pseudoreplication.\n")
     }
   }
 }
 
 
-# Summary and Recommendations
+#===== DISTRIBUTION HISTOGRAMS ==============================================
 
+# 4 response variables x 2 experimenters = 8 panels arranged in a 4x2
+# grid. Each panel shows the seedling-level distribution with a normal
+# overlay (red) and the mean (dashed) so deviations from normality and
+# operator-level shifts are visible at a glance. Saved as a single PNG
+# alongside the run's outputs/.
 cat("\n\n")
 cat(strrep("#", 80), "\n")
 cat("CREATING DISTRIBUTION HISTOGRAMS\n")
-cat(strrep("#", 80), "\n")
-cat("\n")
-cat("Creating histograms showing distribution of all four variables\n")
-cat("AS (left column) vs JZ (right column)\n")
-cat("Individual seedling data with mean lines and normal overlay\n")
-cat("\n")
+cat(strrep("#", 80), "\n\n")
 
-library(ggplot2)
-library(gridExtra)
-
-# Create list to store plots
 histogram_plots <- list()
 plot_counter <- 1
 
@@ -456,13 +569,10 @@ combined_histograms <- gridExtra::grid.arrange(
   )
 )
 
-# Save plot
-# Tag output filename with the input stream so v1-only and hybrid v2+v1
-# runs do not overwrite each other.
-stream_tag <- if (use_v1v2) "v1v2hybrid" else "v1only"
-output_histogram <- paste0(
-  date2, "_ASPScress_seedling_distributions_", stream_tag, ".png"
-)
+# Save plot into the run folder built up top in DERIVED PATHS, using the
+# shared out_path() helper so the filename pattern matches s5 exactly:
+# <date>_<script>_<dataset>_<suffix>.<ext>.
+output_histogram <- out_path("seedling_distributions", "png")
 ggsave(
   filename = output_histogram,
   plot = combined_histograms,

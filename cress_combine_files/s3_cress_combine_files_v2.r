@@ -26,6 +26,22 @@
 # Outputs (under <run_date>_cress_combined/):
 #   cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx
 #   cress_length_ASPS_1-5_repeatability_v1_vs_v2.xlsx
+#
+# Manual v1 data-quality drops
+# ----------------------------
+# Because ASPS 6-10 has no live derivation step (it enters the analysis only
+# via the frozen v1 xlsx -- see REMEASUREMENT_PIPELINE.md), bag-level fixes
+# for those experiments must live here. They are listed in the
+# `v1_bags_to_drop` tibble in section 2 and removed from the v1 stream
+# before bind. To add a new drop, append one row -- no other code change.
+#
+# Currently dropped (both rows are JZ data-entry errors in the source
+# only_combined_data_Kresselaenge_ASPS_6-10_SL.xlsx -- duplicate measurement
+# blocks pasted under wrong filenames; the photos themselves are distinct):
+#   exp_no = "6_A", bag = "10"  -- duplicate data under wrong filename (JZ
+#                                  error); identical to 6_A bag 9.
+#   exp_no = "6_C", bag = "11"  -- duplicate data under wrong filename (JZ
+#                                  error); identical to 6_C bag 10.
 
 library(readxl)
 library(dplyr)
@@ -107,6 +123,30 @@ get_potency <- function(exp_num, code_letter, decoding_table) {
 
 v1 <- read_excel("../input_data/cress_length_ASPS_1-10_alldata_decoded.xlsx") %>%
   mutate(version = "v1_original")
+
+# Manual data-quality drops applied to the v1 stream. Documented at the
+# top of this script. Each row below is one (exp_no, bag) to remove; the
+# reason column is documentation only and is not used in the join. To add
+# a drop, append a row.
+v1_bags_to_drop <- tibble::tribble(
+  ~exp_no, ~bag, ~reason,
+  "6_A",   "10", "Duplicate data under wrong filename, JZ error (identical to 6_A bag 9)",
+  "6_C",   "11", "Duplicate data under wrong filename, JZ error (identical to 6_C bag 10)"
+)
+
+# Apply drops with anti_join and report each removal explicitly to the
+# console so the audit trail is in the run log, not just in this script.
+n_v1_before <- nrow(v1)
+v1 <- v1 %>%
+  anti_join(v1_bags_to_drop %>% select(exp_no, bag),
+            by = c("exp_no", "bag"))
+cat("\nManual v1 drops (", nrow(v1_bags_to_drop), " bag(s), ",
+    n_v1_before - nrow(v1), " rows removed):\n", sep = "")
+for (i in seq_len(nrow(v1_bags_to_drop))) {
+  cat("  ", v1_bags_to_drop$exp_no[i], " bag ", v1_bags_to_drop$bag[i],
+      "  --  ", v1_bags_to_drop$reason[i], "\n", sep = "")
+}
+cat("\n")
 
 v2_raw <- read_excel(v2_input)
 

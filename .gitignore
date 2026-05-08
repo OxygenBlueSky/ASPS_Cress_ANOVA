@@ -10,5 +10,11 @@
 # Excel lock files (created while a workbook is open)
 ~$*
 
+# Archived/superseded copies — kept on disk for reference, not in git
+OLD/
+
+# Generated analysis artifacts (regenerable from scripts + input_data)
+outputs/
+
 # Claude Code
 .claude/
