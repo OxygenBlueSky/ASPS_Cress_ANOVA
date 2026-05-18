@@ -105,6 +105,12 @@ df <- switch(DATASET_VER,
 )
 cat("Rows after dataset_ver filter (", DATASET_VER, "): ", nrow(df), "\n", sep = "")
 
+# Sanity check: every retained row should have a resolved (exp_no, bag).
+# s3 drops the unresolved-filename rows, so a non-zero count here means the
+# upstream guarantee broke and bag-level aggregation would silently lose data.
+n_missing_bagkey <- sum(is.na(df$exp_no) | is.na(df$bag))
+cat("Rows missing exp_no/bag (should be 0): ", n_missing_bagkey, "\n", sep = "")
+
 
 #===== HELPERS ==============================================================
 
@@ -142,6 +148,22 @@ write_cutoff_scan <- function(values, var, scan_seq) {
   cat(paste(lines, collapse = "\n"), "\n", sep = "")
 }
 
+# Aggregate a seed-level numeric vector to one mean per (exp_no, bag). Bags
+# that end up with zero non-NA seeds (can happen for the post-cutoff vector
+# when an entire bag's seeds are below the cutoff) come back as NaN from
+# mean(..., na.rm = TRUE); we coerce those to NA so skewness/ggplot drop
+# them rather than choking. The order of the returned vector doesn't matter
+# -- it's only consumed by histogram + skewness, both of which are
+# order-invariant.
+bag_means <- function(values, exp_no, bag) {
+  key <- paste(exp_no, bag, sep = "__")
+  means <- tapply(values, key, function(v) mean(v, na.rm = TRUE))
+  means <- as.numeric(means)
+  means[is.nan(means)] <- NA
+  means
+}
+
+
 # Per-variable scan ranges. Match the original script's choices so the scans
 # remain comparable across runs.
 scan_ranges <- list(
@@ -178,6 +200,26 @@ for (var in response_vars) {
                             caption_extra = paste0("  (cutoff > ", cutoff, ")")),
          width  = 14, height = 10, units = "cm", dpi = 300)
 
+  # Bag-level view: the ANOVA in s5 operates on per-bag means, so the
+  # skewness that actually matters for downstream inference is the skewness
+  # of those means -- not of the raw seed-level distribution. Averaging
+  # ~16 seeds per bag pulls the distribution toward Gaussian (CLT), so the
+  # "before" panel is typically much closer to symmetric than its seed-level
+  # counterpart, and the seed-level cutoff helps less dramatically here.
+  bag_before <- bag_means(values,    df$exp_no, df$bag)
+  bag_after  <- bag_means(truncated, df$exp_no, df$bag)
+
+  ggsave(out_path(paste0("hist_", var, "_bag_before"), "png"),
+         plot   = make_hist(bag_before,
+                            paste0(var, " (bag mean)")),
+         width  = 14, height = 10, units = "cm", dpi = 300)
+
+  ggsave(out_path(paste0("hist_", var, "_bag_after_cut", cutoff), "png"),
+         plot   = make_hist(bag_after,
+                            paste0(var, " (bag mean)"),
+                            caption_extra = paste0("  (cutoff > ", cutoff, ")")),
+         width  = 14, height = 10, units = "cm", dpi = 300)
+
   new_col <- paste0("T", var, "_cut", cutoff)
   df[[new_col]] <- truncated
 
@@ -185,6 +227,10 @@ for (var in response_vars) {
               cutoff,
               sum(!is.na(truncated)), length(values),
               new_col))
+  cat(sprintf("  bag-level skewness:  before = %5.2f   after = %5.2f   (n_bags = %d)\n",
+              round(skewness(bag_before, na.rm = TRUE), 2),
+              round(skewness(bag_after,  na.rm = TRUE), 2),
+              sum(!is.na(bag_before))))
 }
 
 
