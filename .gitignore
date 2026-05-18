@@ -18,3 +18,6 @@ outputs/
 
 # Claude Code
 .claude/
+
+# Ad-hoc one-off analysis exports (not part of the pipeline)
+bags_with_mean_below_9p5.csv
