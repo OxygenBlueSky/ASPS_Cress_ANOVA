@@ -1,12 +1,20 @@
 # s5_cress_descriptive_anova.r
 #
 # Pipeline step 5: descriptive stats + Type-III ANOVA + emmeans post-hoc
-# + normalized-by-Lactose boxplots, on bag-level means of the cress data.
+# + normalized-by-Lactose boxplots + 2016-vs-2022 line plots, at either
+# bag level OR seedling level (set ANALYSIS_LEVEL in CONFIG below).
 #
-# Why bag-level: the bag is the experimental unit (potency was applied per
-# bag, ~16 seeds per bag). Treating individual seeds as independent inflates
-# Type-I error via pseudoreplication; s6 (ICC) quantifies that. Here we
-# average per bag first and run the ANOVA on those means.
+# Why bag-level by default: the bag is the experimental unit (potency was
+# applied per bag, ~16 seeds per bag). Treating individual seeds as
+# independent inflates Type-I error via pseudoreplication; s6 (ICC)
+# quantifies that. Bag mode averages per bag first and runs the ANOVA on
+# those means. Seedling mode skips the aggregation and runs everything on
+# the raw seed rows -- this is the pseudoreplicated comparator and the
+# p-values it produces should be read as inflated.
+#
+# Each level writes to its own run folder (folder name ends in _baglevel /
+# _seedlinglevel) and every filename inside carries the same suffix, so
+# the two modes never overwrite each other.
 #
 # Design: potency (6 levels) * experiment_number, Type-III SS with
 # contr.sum so the interaction term is testable independently of cell
@@ -38,8 +46,32 @@ library(plotrix)    # std.error() = sd / sqrt(n) for SE error bars
 
 SCRIPT_TAG     <- "s5"
 DATASET_VER    <- "v2"   # "v1" | "v2" | "v1v2"
-USE_SKEWNESS_CORRECTED <- TRUE   # TRUE -> read latest s4 output for DATASET_VER
+USE_SKEWNESS_CORRECTED <- FALSE  # TRUE -> read latest s4 output for DATASET_VER
 RUN_DATE       <- format(Sys.Date(), "%Y%m%d")
+
+# Unit of analysis for the ANOVA and every downstream output.
+#   "bag"      -- average ~16 seeds per bag first, then run all tests / plots
+#                 on those bag means. This is the statistically defensible
+#                 mode: the bag is the experimental unit (potency applied
+#                 per bag), so bag means avoid pseudoreplication.
+#   "seedling" -- skip the bag aggregation and run the same machinery on the
+#                 raw seed-level rows. This is the pseudoreplicated comparator
+#                 -- p-values will be inflated because seeds within a bag are
+#                 not independent. Useful to quantify the cost of treating
+#                 seeds as independent; s6 (ICC) tells you how big that cost is.
+# Both modes write to their own run folder AND carry a level suffix in every
+# filename, so the two never collide on disk.
+ANALYSIS_LEVEL <- "seedling"   # "bag" | "seedling"
+
+# Optional subset of potencies. Useful when the question is just "does
+# Stannum differ from Lactose?" -- restricting to those two before the
+# bag aggregation strips the other four remedies out entirely, so the
+# ANOVA degrees of freedom, post-hoc table, boxplots and line plots all
+# only carry the two-level comparison.
+#   "all"      -- keep all six potencies (default; current behaviour)
+#   "stan_lac" -- keep only Stannum and Lactose
+# Filter is applied once on df_parsed; everything downstream inherits it.
+POTENCY_SUBSET <- "stan_lac"   # "all" | "stan_lac"
 
 # Response variables analysed. When USE_SKEWNESS_CORRECTED is TRUE we look
 # for the matching T<var>_cut* column in the s4 file and use it instead of
@@ -58,16 +90,41 @@ S4_OUTPUTS_ROOT   <- "outputs"
 SCRIPT_PURPOSE <- paste0("anova_",
                          if (USE_SKEWNESS_CORRECTED) "skewcorr" else "raw")
 
+# Level tag appears in both the folder name and every filename so the bag
+# and seedling runs can sit side-by-side without overwriting each other.
+if (!ANALYSIS_LEVEL %in% c("bag", "seedling")) {
+  stop("ANALYSIS_LEVEL must be 'bag' or 'seedling'; got: ", ANALYSIS_LEVEL)
+}
+LEVEL_TAG <- paste0(ANALYSIS_LEVEL, "level")   # "baglevel" or "seedlinglevel"
+
+# Same belt-and-braces approach for the potency subset: the tag goes into the
+# folder name and every filename, so a stan_lac run cannot quietly overwrite
+# an "all" run for the same date/level. POTENCIES_KEEP is the actual filter
+# list used downstream.
+if (!POTENCY_SUBSET %in% c("all", "stan_lac")) {
+  stop("POTENCY_SUBSET must be 'all' or 'stan_lac'; got: ", POTENCY_SUBSET)
+}
+POTENCIES_KEEP <- switch(POTENCY_SUBSET,
+  "all"      = NULL,                       # NULL = no filter applied
+  "stan_lac" = c("Lactose", "Stannum")
+)
+SUBSET_TAG <- switch(POTENCY_SUBSET,
+  "all"      = "allpot",
+  "stan_lac" = "stanlac"
+)
+
 out_dir <- file.path(
   S4_OUTPUTS_ROOT,
-  paste(RUN_DATE, SCRIPT_TAG, SCRIPT_PURPOSE, DATASET_VER, sep = "_")
+  paste(RUN_DATE, SCRIPT_TAG, SCRIPT_PURPOSE, DATASET_VER, LEVEL_TAG,
+        SUBSET_TAG, sep = "_")
 )
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 out_path <- function(suffix, ext) {
   file.path(
     out_dir,
-    paste0(RUN_DATE, "_", SCRIPT_TAG, "_", DATASET_VER, "_", suffix, ".", ext)
+    paste0(RUN_DATE, "_", SCRIPT_TAG, "_", DATASET_VER, "_", LEVEL_TAG,
+           "_", SUBSET_TAG, "_", suffix, ".", ext)
   )
 }
 
@@ -127,6 +184,15 @@ cat(strrep("=", 80), "\n", sep = "")
 cat("Input         : ", input_path, "\n", sep = "")
 cat("Dataset ver   : ", DATASET_VER, "\n", sep = "")
 cat("Skewness corr : ", USE_SKEWNESS_CORRECTED, "\n", sep = "")
+cat("Analysis level: ", ANALYSIS_LEVEL,
+    " (", if (ANALYSIS_LEVEL == "bag") "experimental unit -- defensible"
+          else "pseudoreplicated comparator -- inflated p-values expected",
+    ")\n", sep = "")
+cat("Potency subset: ", POTENCY_SUBSET,
+    if (POTENCY_SUBSET == "stan_lac")
+      " (keeping only Lactose + Stannum; ANOVA potency factor is 2 levels)"
+    else "",
+    "\n", sep = "")
 cat("Output folder : ", out_dir, "\n\n", sep = "")
 
 df_raw <- read_excel(input_path, sheet = "Sheet 1")
@@ -177,6 +243,26 @@ df_parsed <- df_raw %>%
     experimenter = ifelse(experiment_number <= 5, "AS", "JZ")
   )
 
+# Optional potency filter (POTENCY_SUBSET in CONFIG). Applied here, BEFORE
+# the bag aggregation, so df_bags, df_analysis, the bag inventory, ANOVA,
+# post-hoc and both line plots all see only the kept potencies. Names must
+# match the decoded values in df_parsed$potency exactly (e.g. "Ars. album"
+# with a space and lowercase a, "Lactose" capitalised).
+if (!is.null(POTENCIES_KEEP)) {
+  missing_p <- setdiff(POTENCIES_KEEP, unique(df_parsed$potency))
+  if (length(missing_p) > 0) {
+    stop("POTENCY_SUBSET requests potencies not present in the data: ",
+         paste(missing_p, collapse = ", "),
+         ". Available: ", paste(unique(df_parsed$potency), collapse = ", "))
+  }
+  n_before <- nrow(df_parsed)
+  df_parsed <- df_parsed[df_parsed$potency %in% POTENCIES_KEEP, ]
+  cat("\nPotency subset filter: keeping ",
+      paste(POTENCIES_KEEP, collapse = " + "),
+      " -- ", nrow(df_parsed), " of ", n_before, " seed-level rows kept\n",
+      sep = "")
+}
+
 
 #===== CALCULATE BAG-LEVEL MEANS ============================================
 
@@ -203,6 +289,31 @@ cat("\nBag-level rows: ", nrow(df_bags),
     "-", max(df_bags$n_seeds), ")\n", sep = "")
 
 
+#===== SELECT ANALYSIS FRAME (bag vs seedling) ==============================
+
+# Everything downstream -- descriptives, ANOVA, post-hoc, boxplots and the
+# two patchwork line plots -- consumes a single frame named df_analysis.
+# Building it here, in one place, is the single switch point between the
+# two modes; nothing downstream has to know which level it is operating on
+# except for cosmetic labels in printed output and plot titles.
+#
+#   bag      -- df_analysis = df_bags (already built above)
+#   seedling -- df_analysis = df_parsed restricted to the columns the
+#               downstream code uses, with no aggregation. Seeds within a
+#               bag are NOT independent, so any inferential output here is
+#               pseudoreplicated; s6 ICC quantifies the inflation.
+if (ANALYSIS_LEVEL == "bag") {
+  df_analysis <- df_bags
+} else {
+  df_analysis <- df_parsed %>%
+    select(experiment_number, experimenter, potency_code, potency, bag,
+           exp_no, label, all_of(response_vars))
+  cat("\nSeedling-level rows: ", nrow(df_analysis), "\n", sep = "")
+  cat("  (each row = one seedling; bag means are NOT pre-computed in this",
+      " mode)\n", sep = "")
+}
+
+
 #===== BAG INVENTORY ========================================================
 
 # Full enumeration of every bag that survives into df_bags, with the seed
@@ -217,6 +328,8 @@ cat("\nBag-level rows: ", nrow(df_bags),
 cat("\n", strrep("#", 80), "\n", sep = "")
 cat("BAG INVENTORY (dataset feeding this run)\n")
 cat(strrep("#", 80), "\n", sep = "")
+
+if (ANALYSIS_LEVEL == "bag") {
 
 # (1) Per-experiment summary: how many bags and seeds per experiment, and
 # the spread of seeds-per-bag within that experiment.
@@ -270,27 +383,45 @@ print.data.frame(bag_totals, row.names = FALSE)
 cat("Grand total: ", nrow(df_bags), " bags, ",
     sum(df_bags$n_seeds), " seeds\n", sep = "")
 
+} else {
+  # Seedling-level run: skip the per-bag matrix (the bag is no longer the
+  # analysis unit here) and just print one summary line per experimenter
+  # / experiment so the dataset feeding the seedling ANOVA is still
+  # auditable from the console.
+  seedling_inventory <- df_analysis %>%
+    group_by(experimenter, experiment_number) %>%
+    summarise(n_seedlings = n(), .groups = "drop") %>%
+    arrange(experimenter, experiment_number)
+  cat("\nPer-experiment seedling counts:\n")
+  print.data.frame(seedling_inventory, row.names = FALSE)
+  cat("Grand total: ", nrow(df_analysis), " seedlings\n", sep = "")
+}
 
-# Factorise grouping vars so Anova(type="III") gets the right contrasts.
-df_bags$experiment_number <- as.factor(df_bags$experiment_number)
-df_bags$potency           <- as.factor(df_bags$potency)
-df_bags$potency_code      <- as.factor(df_bags$potency_code)
-df_bags$experimenter      <- as.factor(df_bags$experimenter)
+
+# Factorise grouping vars on df_analysis (the frame every downstream block
+# consumes) so Anova(type="III") gets the right contrasts. Same column set
+# exists in both modes -- df_analysis is either bag-aggregated rows or raw
+# seedling rows from df_parsed, but both carry the four grouping columns.
+df_analysis$experiment_number <- as.factor(df_analysis$experiment_number)
+df_analysis$potency           <- as.factor(df_analysis$potency)
+df_analysis$potency_code      <- as.factor(df_analysis$potency_code)
+df_analysis$experimenter      <- as.factor(df_analysis$experimenter)
 
 
 #===== ANALYSIS GROUPS ======================================================
 
 # Three parallel cuts: all data, AS-only (exp 1-5), JZ-only (exp 6-10).
 # Splitting by experimenter lets us see operator-specific effects without
-# polluting the combined model.
+# polluting the combined model. Same three cuts apply at either level --
+# only the unit of analysis (bag mean vs raw seedling row) changes.
 analysis_groups <- list(
   ALL = list(name = "ALL DATA (ASPS 1-10)",
-             data = df_bags, sheet_name = "ALL"),
+             data = df_analysis, sheet_name = "ALL"),
   AS  = list(name = "AS ONLY (ASPS 1-5)",
-             data = df_bags %>% filter(experimenter == "AS"),
+             data = df_analysis %>% filter(experimenter == "AS"),
              sheet_name = "AS"),
   JZ  = list(name = "JZ ONLY (ASPS 6-10)",
-             data = df_bags %>% filter(experimenter == "JZ"),
+             data = df_analysis %>% filter(experimenter == "JZ"),
              sheet_name = "JZ")
 )
 
@@ -320,7 +451,10 @@ for (group_key in names(analysis_groups)) {
   df_subset <- group$data
   cat("\n", strrep("=", 80), "\n", group$name, "\n",
       strrep("=", 80), "\n", sep = "")
-  cat("N bags: ", nrow(df_subset), "\n", sep = "")
+  # Row count label tracks the active level so the console log is self-
+  # describing whether each row is a bag mean or a seedling.
+  cat("N ", if (ANALYSIS_LEVEL == "bag") "bags" else "seedlings",
+      ": ", nrow(df_subset), "\n", sep = "")
 
   for (var in response_vars) {
     cat("\n--- ", toupper(var), " ---\n", sep = "")
@@ -353,7 +487,17 @@ for (group_key in names(analysis_groups)) {
 #===== ANOVA (Type III SS) ==================================================
 
 cat("\n\n", strrep("#", 80), "\n", sep = "")
-cat("ANOVA (Type-III SS, bag-level means, contr.sum)\n")
+cat("ANOVA (Type-III SS, ", ANALYSIS_LEVEL,
+    "-level rows, contr.sum",
+    if (POTENCY_SUBSET != "all")
+      paste0(", subset=", paste(POTENCIES_KEEP, collapse = "+"))
+    else "",
+    ")\n", sep = "")
+if (ANALYSIS_LEVEL == "seedling") {
+  cat("WARNING: seedling-level ANOVA is pseudoreplicated -- seeds within a ",
+      "bag\n         are not independent. P-values will be optimistic; ",
+      "see s6 ICC.\n", sep = "")
+}
 cat(strrep("#", 80), "\n", sep = "")
 
 # contr.sum required so Type-III SS for main effects is interpretable in
@@ -421,9 +565,23 @@ for (group_key in names(analysis_groups)) {
   results_df <- data.frame(Parameter = rownames(results_df),
                            results_df, stringsAsFactors = FALSE)
 
+  # Title row carries the level tag (e.g. "[SEEDLING-LEVEL]") so anyone
+  # opening the workbook sees the unit of analysis without having to read
+  # the filename. The pseudoreplication caveat is spelled out for the
+  # seedling sheet only -- bag-level needs no caveat.
+  level_tag_inline <- paste0("[", toupper(ANALYSIS_LEVEL), "-LEVEL]")
+  subset_tag_inline <- if (POTENCY_SUBSET != "all")
+    paste0(" [", paste(POTENCIES_KEEP, collapse = "+"), " ONLY]") else ""
   addWorksheet(wb_anova, sheet)
-  writeData(wb_anova, sheet, paste0("ANOVA Summary: ", group$name),
+  writeData(wb_anova, sheet,
+            paste0("ANOVA Summary ", level_tag_inline, subset_tag_inline,
+                   ": ", group$name),
             startRow = 1, startCol = 1)
+  if (ANALYSIS_LEVEL == "seedling") {
+    writeData(wb_anova, sheet,
+              "Seedling-level (pseudoreplicated comparator -- see s6 ICC).",
+              startRow = 2, startCol = 1)
+  }
   writeData(wb_anova, sheet, results_df, startRow = 3, rowNames = FALSE)
   addStyle(wb_anova, sheet, style_header,
            rows = 3, cols = 1:4, gridExpand = TRUE)
@@ -534,12 +692,26 @@ for (group_key in names(analysis_groups)) {
   cat("\n", strrep("=", 80), "\n", group$name, "\n",
       strrep("=", 80), "\n", sep = "")
 
+  # Title row carries the level tag so the workbook is self-describing;
+  # filename also carries it, this is belt-and-braces.
+  level_tag_inline <- paste0("[", toupper(ANALYSIS_LEVEL), "-LEVEL]")
+  subset_tag_inline <- if (POTENCY_SUBSET != "all")
+    paste0(" [", paste(POTENCIES_KEEP, collapse = "+"), " ONLY]") else ""
   addWorksheet(wb_posthoc, sheet)
   current_row <- 1
-  writeData(wb_posthoc, sheet, paste0("Post Hoc Tests: ", group$name),
+  writeData(wb_posthoc, sheet,
+            paste0("Post Hoc Tests ", level_tag_inline, subset_tag_inline,
+                   ": ", group$name),
             startRow = current_row, startCol = 1)
   addStyle(wb_posthoc, sheet, style_bold, rows = current_row, cols = 1)
-  current_row <- current_row + 2
+  current_row <- current_row + 1
+  if (ANALYSIS_LEVEL == "seedling") {
+    writeData(wb_posthoc, sheet,
+              "Seedling-level (pseudoreplicated -- see s6 ICC).",
+              startRow = current_row, startCol = 1)
+    current_row <- current_row + 1
+  }
+  current_row <- current_row + 1
 
   n_remedies <- length(levels(df_subset$potency))
 
@@ -727,7 +899,8 @@ for (group_key in names(analysis_groups)) {
       grobs  = panels,
       ncol   = n_exp, nrow = 1,
       top    = grid::textGrob(
-        paste0(var, " (", group_label, ") -- normalized to Lactose mean = ",
+        paste0(var, " (", group_label, ", ", ANALYSIS_LEVEL,
+               "-level) -- normalized to Lactose mean = ",
                sprintf("%.3f", lactose_mean)),
         gp = grid::gpar(fontsize = 14, fontface = "bold")),
       bottom = legend
@@ -752,8 +925,8 @@ for (group_key in names(analysis_groups)) {
       grobs  = panels,
       ncol   = length(potencies), nrow = 1,
       top    = grid::textGrob(
-        paste0(var, " by Potency (", group_label,
-               ") -- normalized to Lactose mean = ",
+        paste0(var, " by Potency (", group_label, ", ", ANALYSIS_LEVEL,
+               "-level) -- normalized to Lactose mean = ",
                sprintf("%.3f", lactose_mean)),
         gp = grid::gpar(fontsize = 14, fontface = "bold")),
       bottom = legend
@@ -776,11 +949,14 @@ for (group_key in names(analysis_groups)) {
 # share y-limits so the two cohorts are directly comparable; the right column
 # drops its y-axis to give the panels more horizontal room.
 #
-# Each point is the (experiment, remedy) bag-level mean and the error bar is
-# +/- 1 SE across bags within that cell (SE = sd / sqrt(n_bags)). The error
-# bars therefore represent bag-to-bag variability, NOT seed-to-seed -- this
-# is intentional: the bag is the experimental unit and seed-level SE would
-# pseudoreplicate (see s6 ICC for the pseudoreplication penalty).
+# Each point is the (experiment, remedy) mean computed over whatever unit
+# ANALYSIS_LEVEL is set to, and the error bar is +/- 1 SE across those units
+# within that cell (SE = sd / sqrt(n)). In bag mode the error bars therefore
+# represent bag-to-bag variability (the statistically correct choice -- the
+# bag is the experimental unit). In seedling mode they represent seed-to-
+# seed variability within each (experiment, remedy) cell, which understates
+# the true uncertainty because seeds within a bag are not independent (see
+# s6 ICC for the pseudoreplication penalty).
 #
 # x-axis is numeric experiment_number so any missing experiment leaves a
 # real gap (e.g. if exp 4 is absent for AS in the current DATASET_VER, the
@@ -801,10 +977,12 @@ potency_colors <- c(
   "Mercury"    = "#919191"
 )
 
-# Aggregate bag-level rows to one mean +/- SE per (cohort, experiment, remedy).
+# Aggregate analysis rows to one mean +/- SE per (cohort, experiment, remedy).
 # experiment_number was factorised at the ANOVA stage; convert back to integer
 # here so the x-axis can be numeric (real gaps for missing experiments).
-df_lineplot <- df_bags %>%
+# n_rows reports the number of units (bags or seedlings) per cell, depending
+# on ANALYSIS_LEVEL -- the subtitle below picks wording to match.
+df_lineplot <- df_analysis %>%
   mutate(
     experiment_number  = as.integer(as.character(experiment_number)),
     potency            = as.character(potency),
@@ -817,7 +995,7 @@ df_lineplot <- df_bags %>%
     across(all_of(response_vars),
            list(mean = ~mean(.x, na.rm = TRUE),
                 se   = ~plotrix::std.error(.x, na.rm = TRUE))),
-    n_bags = n(),
+    n_rows = n(),
     .groups = "drop"
   ) %>%
   # Lock factor order so the legend follows potency_hierarchy and the colour
@@ -903,9 +1081,15 @@ grid_plot <- patchwork::wrap_plots(plot_list,
                                    ncol = 2,
                                    nrow = length(response_vars)) +
   patchwork::plot_annotation(
-    title    = "ASPS Cress Analysis: All six potencies",
-    subtitle = paste0("Mean +/- SE across bags (n_bags varies per cell); ",
-                      "dataset version: ", DATASET_VER),
+    title    = paste0("ASPS Cress Analysis (", ANALYSIS_LEVEL, "-level): ",
+                      if (POTENCY_SUBSET == "all") "All six potencies"
+                      else paste(POTENCIES_KEEP, collapse = " + ")),
+    subtitle = paste0(
+      if (ANALYSIS_LEVEL == "bag")
+        "Mean +/- SE across bags (n_bags varies per cell); "
+      else
+        "Mean +/- SE across seedlings (n_seedlings varies per cell); ",
+      "dataset version: ", DATASET_VER),
     theme    = theme(
       plot.title    = element_text(face = "bold", size = 18, hjust = 0.5),
       plot.subtitle = element_text(size = 11, hjust = 0.5)
@@ -934,16 +1118,17 @@ cat("\nWrote line plot: ", out_lineplot, "\n", sep = "")
 # matching scale_linetype_manual() call -- this is the standard ggplot
 # trick for putting a non-aesthetic geom into the legend cleanly.
 #
-# Standardisation is done at bag level BEFORE aggregation: for each
-# (experimenter, experiment_number) cell we compute the mean of Lactose bags
-# in that cell and divide every bag in that cell by it. Mean +/- SE are then
-# computed on the standardised bag values, so error bars again represent
-# bag-to-bag variability (now relative to the local Lactose baseline).
+# Standardisation is done at row level BEFORE aggregation: for each
+# (experimenter, experiment_number) cell we compute the mean of the Lactose
+# rows in that cell (bags if ANALYSIS_LEVEL=="bag", seedlings if
+# "seedling") and divide every row in that cell by it. Mean +/- SE are then
+# computed on the standardised values, so error bars represent the same
+# unit-to-unit variability as the raw line plot above, just rescaled.
 
 baseline_value <- 1  # divide mode -> Lactose collapses to 1.0
 
-# Standardise at bag level, per experiment.
-df_bags_std <- df_bags %>%
+# Standardise at the active unit level, per experiment.
+df_analysis_std <- df_analysis %>%
   mutate(
     experiment_number = as.integer(as.character(experiment_number)),
     potency           = as.character(potency)
@@ -956,9 +1141,9 @@ df_bags_std <- df_bags %>%
                 })) %>%
   ungroup()
 
-# Aggregate the standardised bag values to (cohort, experiment, remedy).
+# Aggregate the standardised values to (cohort, experiment, remedy).
 # Lactose is dropped because it sits on the dashed baseline by construction.
-df_lineplot_std <- df_bags_std %>%
+df_lineplot_std <- df_analysis_std %>%
   filter(potency != "Lactose") %>%
   mutate(experimenter_label = ifelse(experimenter == "AS",
                                      "2016 data (Experiments 1-5)",
@@ -968,7 +1153,7 @@ df_lineplot_std <- df_bags_std %>%
     across(all_of(response_vars),
            list(mean = ~mean(.x, na.rm = TRUE),
                 se   = ~plotrix::std.error(.x, na.rm = TRUE))),
-    n_bags = n(),
+    n_rows = n(),
     .groups = "drop"
   ) %>%
   mutate(potency = factor(potency,
@@ -1063,10 +1248,17 @@ grid_plot_std <- patchwork::wrap_plots(plot_list_std,
                                        ncol = 2,
                                        nrow = length(response_vars)) +
   patchwork::plot_annotation(
-    title    = "ASPS Cress Analysis (lactose-standardised, divide): All six potencies",
-    subtitle = paste0("Each bag value = (treatment / per-experiment lactose mean); ",
-                      "dashed line = lactose baseline (1); ",
-                      "dataset version: ", DATASET_VER),
+    title    = paste0("ASPS Cress Analysis (lactose-standardised, divide, ",
+                      ANALYSIS_LEVEL, "-level): ",
+                      if (POTENCY_SUBSET == "all") "All six potencies"
+                      else paste(POTENCIES_KEEP, collapse = " + ")),
+    subtitle = paste0(
+      if (ANALYSIS_LEVEL == "bag")
+        "Each bag value = (treatment / per-experiment lactose bag mean); "
+      else
+        "Each seedling value = (treatment / per-experiment lactose seedling mean); ",
+      "dashed line = lactose baseline (1); ",
+      "dataset version: ", DATASET_VER),
     theme    = theme(
       plot.title    = element_text(face = "bold", size = 18, hjust = 0.5),
       plot.subtitle = element_text(size = 11, hjust = 0.5)
@@ -1088,12 +1280,20 @@ cat("Wrote lactose-std line plot: ", out_lineplot_std, "\n", sep = "")
 cat("\n\n", strrep("#", 80), "\n", sep = "")
 cat("DONE\n")
 cat(strrep("#", 80), "\n", sep = "")
-cat("Output folder: ", out_dir, "\n", sep = "")
-cat("ANOVA xlsx   : ", basename(out_anova), "\n", sep = "")
-cat("Post-hoc xlsx: ", basename(out_posthoc), "\n", sep = "")
-cat("Plots        : 24 PNG files (4 vars * 3 groups * 2 layouts)\n")
-cat("Line plot    : ", basename(out_lineplot), "\n", sep = "")
-cat("Line plot std: ", basename(out_lineplot_std), "\n", sep = "")
+cat("Analysis level: ", ANALYSIS_LEVEL, "\n", sep = "")
+cat("Potency subset: ", POTENCY_SUBSET,
+    if (POTENCY_SUBSET != "all")
+      paste0(" (", paste(POTENCIES_KEEP, collapse = " + "), ")")
+    else "",
+    "\n", sep = "")
+cat("Output folder : ", out_dir, "\n", sep = "")
+cat("ANOVA xlsx    : ", basename(out_anova), "\n", sep = "")
+cat("Post-hoc xlsx : ", basename(out_posthoc), "\n", sep = "")
+cat("Plots         : 24 PNG files (4 vars * 3 groups * 2 layouts)\n")
+cat("Line plot     : ", basename(out_lineplot), "\n", sep = "")
+cat("Line plot std : ", basename(out_lineplot_std), "\n", sep = "")
+unit_word <- if (ANALYSIS_LEVEL == "bag") "bags" else "seedlings"
 for (group_key in names(analysis_groups)) {
-  cat(sprintf("  %s: %d bags\n", group_key, nrow(analysis_groups[[group_key]]$data)))
+  cat(sprintf("  %s: %d %s\n", group_key,
+              nrow(analysis_groups[[group_key]]$data), unit_word))
 }
