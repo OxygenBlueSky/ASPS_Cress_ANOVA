@@ -39,6 +39,7 @@ library(tidyr)
 library(ICC)
 library(ggplot2)
 library(gridExtra)
+library(openxlsx)   # write_xlsx multi-sheet workbook for the overview output
 
 
 #===== CONFIG ===============================================================
@@ -280,19 +281,26 @@ cat("DEFF > 2 indicates serious pseudoreplication issues.\n")
 cat("\n")
 cat(strrep("#", 80), "\n")
 
+# Accumulator for the xlsx overview sheet. Keyed by "<group>__<var>" so the
+# ANOVA loop below can find and extend the same row written by the ICC loop
+# here without re-running ICCbare or Anova. Filled in two stages:
+#   stage 1 (this loop): n_seedlings, n_bags, avg_seeds_per_bag, ICC metrics
+#   stage 2 (ANOVA loop): bag-/seedling-level p-values, ratios, alert flags
+overview_rows <- list()
+
 for (group_key in names(analysis_groups)) {
-  
+
   group <- analysis_groups[[group_key]]
   df_subset <- group$data_seedlings
-  
+
   cat("\n")
   cat(strrep("=", 80), "\n")
   cat(group$name, "\n")
   cat(strrep("=", 80), "\n")
-  
+
   cat(sprintf("\nN seedlings: %d\n", nrow(df_subset)))
   cat(sprintf("N bags: %d\n", length(unique(df_subset$bag_id))))
-  
+
   avg_cluster_size <- nrow(df_subset) / length(unique(df_subset$bag_id))
   cat(sprintf("Average seedlings per bag: %.1f\n", avg_cluster_size))
   
@@ -342,11 +350,25 @@ for (group_key in names(analysis_groups)) {
       
       # Effective sample size
       effective_n <- nrow(icc_data) / deff
-      cat(sprintf("  Effective sample size: %.0f (vs actual %d seedlings)\n", 
+      info_loss_pct <- (1 - effective_n / nrow(icc_data)) * 100
+      cat(sprintf("  Effective sample size: %.0f (vs actual %d seedlings)\n",
                   effective_n, nrow(icc_data)))
-      cat(sprintf("  Information loss: %.1f%%\n", 
-                  (1 - effective_n / nrow(icc_data)) * 100))
-      
+      cat(sprintf("  Information loss: %.1f%%\n", info_loss_pct))
+
+      # Stash this group/var row for the xlsx overview; ANOVA loop will
+      # extend it with the bag/seedling p-values below.
+      overview_rows[[paste(group_key, var, sep = "__")]] <- list(
+        response_variable = var,
+        analysis_group    = group_key,
+        n_seedlings       = nrow(df_subset),
+        n_bags            = length(unique(df_subset$bag_id)),
+        avg_seeds_per_bag = avg_cluster_size,
+        icc               = icc_result,
+        deff              = deff,
+        effective_n       = effective_n,
+        info_loss_pct     = info_loss_pct
+      )
+
     }, error = function(e) {
       cat(sprintf("  ERROR calculating ICC: %s\n", e$message))
     })
@@ -474,16 +496,110 @@ for (group_key in names(analysis_groups)) {
     # significant (seedling-level, pseudoreplicated). These are the
     # textbook pseudoreplication false positives that motivate s5
     # running on bag means.
-    if (p_pot_seedlings < 0.05 && p_pot_bags >= 0.05) {
+    alert_potency_falsepos     <- p_pot_seedlings < 0.05 && p_pot_bags >= 0.05
+    alert_interaction_falsepos <- p_int_seedlings < 0.05 && p_int_bags >= 0.05
+    if (alert_potency_falsepos) {
       cat("\n  ALERT: Potency effect significant at seedling-level but NOT at bag-level.\n")
       cat("         Likely false positive due to pseudoreplication.\n")
     }
-    if (p_int_seedlings < 0.05 && p_int_bags >= 0.05) {
+    if (alert_interaction_falsepos) {
       cat("\n  ALERT: Interaction significant at seedling-level but NOT at bag-level.\n")
       cat("         Likely false positive due to pseudoreplication.\n")
     }
+
+    # Extend the overview row stashed by the ICC loop above with the
+    # p-values, ratios, and alert flags. Guard with the key check so a
+    # row whose ICC errored out is left out of the workbook rather than
+    # silently filled with half-data.
+    key <- paste(group_key, var, sep = "__")
+    if (!is.null(overview_rows[[key]])) {
+      overview_rows[[key]] <- c(
+        overview_rows[[key]],
+        list(
+          p_potency_bag              = p_pot_bags,
+          p_experiment_bag           = p_exp_bags,
+          p_interaction_bag          = p_int_bags,
+          p_potency_seed             = p_pot_seedlings,
+          p_experiment_seed          = p_exp_seedlings,
+          p_interaction_seed         = p_int_seedlings,
+          ratio_potency              = p_pot_bags / p_pot_seedlings,
+          ratio_experiment           = p_exp_bags / p_exp_seedlings,
+          ratio_interaction          = p_int_bags / p_int_seedlings,
+          alert_potency_falsepos     = alert_potency_falsepos,
+          alert_interaction_falsepos = alert_interaction_falsepos
+        )
+      )
+    }
   }
 }
+
+
+#===== WRITE OVERVIEW XLSX ==================================================
+
+# Single-file scannable summary of the two console blocks above. Sheet
+# layout = one row per (response_variable x analysis_group), sorted so
+# each variable's ALL/AS/JZ trio sits together (variable x group block
+# layout). Numbers are read straight from overview_rows -- no recompute.
+df_overview <- dplyr::bind_rows(lapply(overview_rows, as.data.frame,
+                                       stringsAsFactors = FALSE)) %>%
+  mutate(
+    response_variable = factor(response_variable, levels = response_vars),
+    analysis_group    = factor(analysis_group,    levels = c("ALL", "AS", "JZ"))
+  ) %>%
+  arrange(response_variable, analysis_group) %>%
+  mutate(
+    response_variable = as.character(response_variable),
+    analysis_group    = as.character(analysis_group)
+  )
+
+# Column-by-column legend so the xlsx is self-documenting -- a reader
+# coming back to the file in six months doesn't need to dig the script
+# out to recall what DEFF or ratio_potency means.
+df_legend <- tibble::tribble(
+  ~column,                        ~meaning,
+  "response_variable",            "Response measured (sprout_length, root_length, seedling_length, root_sprout_ratio).",
+  "analysis_group",               "ALL = ASPS 1-10 pooled, AS = experimenter AS (ASPS 1-5), JZ = experimenter JZ (ASPS 6-10).",
+  "n_seedlings",                  "Number of seed-level rows used (after DATASET_VER filter and NA handling).",
+  "n_bags",                       "Number of unique bags (experimental units) in this group.",
+  "avg_seeds_per_bag",            "Mean cluster size = n_seedlings / n_bags.",
+  "icc",                          "Intraclass correlation (one-way random effects, ICC::ICCbare). Proportion of variance between bags vs total.",
+  "deff",                         "Design effect = 1 + (avg_seeds_per_bag - 1) * icc. Standard-error inflation factor from clustering.",
+  "effective_n",                  "n_seedlings / deff. Independent-sample-size equivalent.",
+  "info_loss_pct",                "(1 - effective_n / n_seedlings) * 100. Pseudoreplication tax in percent.",
+  "p_potency_bag",                "Type-III ANOVA p-value for potency on BAG MEANS (correct analysis).",
+  "p_experiment_bag",             "Type-III ANOVA p-value for experiment_number on bag means.",
+  "p_interaction_bag",            "Type-III ANOVA p-value for potency:experiment_number on bag means.",
+  "p_potency_seed",               "Type-III ANOVA p-value for potency on raw seedlings (pseudoreplicated -- shown for comparison only).",
+  "p_experiment_seed",            "Type-III ANOVA p-value for experiment_number on raw seedlings.",
+  "p_interaction_seed",           "Type-III ANOVA p-value for potency:experiment_number on raw seedlings.",
+  "ratio_potency",                "p_potency_bag / p_potency_seed. Larger => more inflation at seed level.",
+  "ratio_experiment",             "p_experiment_bag / p_experiment_seed.",
+  "ratio_interaction",            "p_interaction_bag / p_interaction_seed.",
+  "alert_potency_falsepos",       "TRUE if potency is significant at seed level (p<0.05) but NOT at bag level -- pseudoreplication false positive.",
+  "alert_interaction_falsepos",   "TRUE if the interaction shows the same pattern."
+)
+
+# ICC interpretation thresholds and DEFF rule-of-thumb, appended as a
+# notes block under the column legend so both live on the same sheet.
+df_legend_notes <- tibble::tribble(
+  ~column,    ~meaning,
+  "",         "",
+  "NOTES",    "",
+  "ICC < 0.05",                  "Very weak clustering -- seedlings nearly independent.",
+  "ICC 0.05-0.15",               "Weak clustering.",
+  "ICC 0.15-0.30",               "Moderate clustering.",
+  "ICC > 0.30",                  "Strong clustering -- seedlings within bags very similar.",
+  "DEFF > 2",                    "Serious pseudoreplication: standard errors more than doubled by clustering.",
+  "False positive (alert_*)",    "Term reaches p<0.05 only because non-independent seedlings were treated as independent."
+)
+df_legend <- dplyr::bind_rows(df_legend, df_legend_notes)
+
+output_overview <- out_path("icc_anova_overview", "xlsx")
+openxlsx::write.xlsx(
+  list(overview = df_overview, legend = df_legend),
+  file = output_overview
+)
+cat(sprintf("\nOverview xlsx saved as: %s\n", output_overview))
 
 
 #===== DISTRIBUTION HISTOGRAMS ==============================================
