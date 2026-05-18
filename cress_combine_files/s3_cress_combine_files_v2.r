@@ -25,7 +25,19 @@
 #                                                             s2_import_imagej_remeasured.r)
 # Outputs (under <run_date>_cress_combined/):
 #   cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx
+#   cress_length_ASPS_1-10_excluded_nonpositive.xlsx
 #   cress_length_ASPS_1-5_repeatability_v1_vs_v2.xlsx
+#
+# Measurement-quality filter
+# --------------------------
+# Before writing the canonical combined file, rows are dropped if ANY of
+# the four measurement columns (sprout_length, seedling_length,
+# root_length, root_sprout_ratio) is <= 0 or NA. Such values are
+# biologically implausible / unusable and would distort downstream
+# means and ANOVAs. The dropped rows are preserved verbatim in
+# cress_length_ASPS_1-10_excluded_nonpositive.xlsx with an extra
+# `exclusion_reason` column listing every offending parameter, so the
+# audit trail survives outside the analysis dataset.
 #
 # Manual v1 data-quality drops
 # ----------------------------
@@ -223,16 +235,76 @@ cat("  in_v1_analysis = TRUE:", sum(combined$in_v1_analysis), "\n")
 cat("  in_v2_analysis = TRUE:", sum(combined$in_v2_analysis),
     "  (v2 ASPS 1-5 + v1 ASPS 6-10)\n")
 
+n_before_filter <- nrow(combined)
+
+
+#===== SECTION 4b: Drop rows with non-positive / NA measurements =============
+
+# Any of the four measurement columns being <= 0 or NA flags the row as
+# unusable for analysis. We split combined into the cleaned analysis
+# dataset and an `excluded` frame that retains every dropped row plus an
+# `exclusion_reason` string listing which of the four columns triggered
+# the drop (a single row can fail on multiple columns).
+
+bad_sprout   <- is.na(combined$sprout_length)     | combined$sprout_length     <= 0
+bad_seedling <- is.na(combined$seedling_length)   | combined$seedling_length   <= 0
+bad_root     <- is.na(combined$root_length)       | combined$root_length       <= 0
+bad_ratio    <- is.na(combined$root_sprout_ratio) | combined$root_sprout_ratio <= 0
+
+is_excluded <- bad_sprout | bad_seedling | bad_root | bad_ratio
+
+# Build a human-readable reason per excluded row. For each of the four
+# checks we emit either "<col>=NA" or "<col><=0", then paste the active
+# reasons together with "; " separators.
+reason_for <- function(bad_col, is_na_col, col_name) {
+  ifelse(!bad_col, "",
+         ifelse(is_na_col, paste0(col_name, "=NA"),
+                           paste0(col_name, "<=0")))
+}
+reasons <- cbind(
+  reason_for(bad_sprout,   is.na(combined$sprout_length),     "sprout_length"),
+  reason_for(bad_seedling, is.na(combined$seedling_length),   "seedling_length"),
+  reason_for(bad_root,     is.na(combined$root_length),       "root_length"),
+  reason_for(bad_ratio,    is.na(combined$root_sprout_ratio), "root_sprout_ratio")
+)
+exclusion_reason <- apply(reasons, 1, function(r) {
+  paste(r[r != ""], collapse = "; ")
+})
+
+excluded <- combined[is_excluded, , drop = FALSE]
+excluded$exclusion_reason <- exclusion_reason[is_excluded]
+
+combined <- combined[!is_excluded, , drop = FALSE]
+
+cat("\nExcluded (non-positive or NA in any of 4 params): ",
+    sum(is_excluded), " rows\n", sep = "")
+cat("  by column (a row can hit multiple):\n")
+cat("    sprout_length     <=0 or NA: ", sum(bad_sprout),   "\n", sep = "")
+cat("    seedling_length   <=0 or NA: ", sum(bad_seedling), "\n", sep = "")
+cat("    root_length       <=0 or NA: ", sum(bad_root),     "\n", sep = "")
+cat("    root_sprout_ratio <=0 or NA: ", sum(bad_ratio),    "\n", sep = "")
+cat("Rows kept: ", nrow(combined), " of ", n_before_filter, "\n\n", sep = "")
+
+
+#===== SECTION 4c: Write canonical combined + excluded files =================
+
 out_file <- file.path(output_dir,
                       "cress_length_ASPS_1-10_alldata_decoded_v1v2.xlsx")
 write.xlsx(combined, file = out_file, rowNames = FALSE)
 cat("Wrote", out_file, "\n")
 
+excluded_file <- file.path(output_dir,
+                           "cress_length_ASPS_1-10_excluded_nonpositive.xlsx")
+write.xlsx(excluded, file = excluded_file, rowNames = FALSE)
+cat("Wrote", excluded_file, "\n")
+
 
 #===== SECTION 5: Quick repeatability summary (v1 vs v2 on ASPS 1-5) =========
 
-# Bag-level means side-by-side. Useful first sanity check before formal
-# Bland-Altman / scatter plotting in a separate analysis script.
+# Bag-level means side-by-side, computed AFTER the section 4b exclusion
+# filter so the summary reflects the cleaned analysis dataset. Useful
+# first sanity check before formal Bland-Altman / scatter plotting in a
+# separate analysis script.
 
 repeatability <- combined %>%
   filter(exp_no %in% unique(v2$exp_no)) %>%
